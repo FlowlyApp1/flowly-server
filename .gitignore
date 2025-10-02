@@ -1,0 +1,17 @@
+# dependencies
+node_modules/
+
+# env & secrets
+.env
+.env.*
+*.env
+serviceAccount.json
+*.pem
+*.key
+*.p12
+
+# logs & misc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store
