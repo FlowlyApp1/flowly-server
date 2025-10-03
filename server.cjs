@@ -1,16 +1,14 @@
-// Minimal secure AI proxy for Flowly
-// Node 18+ required (has global fetch)
+// server.cjs — minimal secure AI proxy for Flowly with context support
+// Node 18+ (Render uses 20.x per your package.json)
 const express = require('express');
 const cors = require('cors');
 
 const PORT = process.env.PORT || 3333;
-const OPENAI_KEY = process.env.OPENAI_API_KEY; // DO NOT expose to client
+const OPENAI_KEY = process.env.OPENAI_API_KEY; // keep secret on server
 const MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 const app = express();
 app.use(express.json());
-
-// CORS: during dev, allow all; for prod, set your domain
 app.use(cors({ origin: true, credentials: false }));
 
 app.get('/health', (_req, res) => res.type('text/plain').send('ok'));
@@ -18,38 +16,53 @@ app.get('/health', (_req, res) => res.type('text/plain').send('ok'));
 app.post('/ai/chat', async (req, res) => {
   try {
     const prompt = (req.body?.prompt || '').toString();
+    const context = req.body?.context ?? null;
 
     if (!OPENAI_KEY) {
-      // Still return something so the app is usable in dev
       return res.json({
-        text: prompt ? `Echo (no OPENAI_API_KEY set): ${prompt}` : 'Send { "prompt": "..." }'
+        text: prompt ? `Echo (no OPENAI_API_KEY set): ${prompt}` : 'Send { "prompt": "..." }',
       });
     }
+
+    // Build the chat messages with explicit context
+    const messages = [
+      {
+        role: "system",
+        content: "You are Flowly AI. Be concise, encouraging, and actionable. " +
+                 "You are given JSON context about budget, fitness, nutrition, and planning. " +
+                 "Always use this JSON to tailor answers. If something is missing, say so briefly."
+      },
+      context
+        ? {
+            role: "system",
+            content: `Here is the context JSON:\n${JSON.stringify(context).slice(0, 12000)}`
+          }
+        : null,
+      { role: "user", content: prompt || "Help me with my Flowly data." }
+    ].filter(Boolean);
 
     const r = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${OPENAI_KEY}`,
+        Authorization: `Bearer ${OPENAI_KEY}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
         model: MODEL,
-        messages: [
-          { role: 'system', content: 'You are Flowly AI. Be concise and helpful.' },
-          { role: 'user', content: prompt }
-        ],
-        temperature: 0.4
-      })
+        temperature: 0.4,
+        messages,
+      }),
     });
 
     if (!r.ok) {
       const errText = await r.text().catch(() => '');
-      return res.json({ text: `AI error (HTTP ${r.status}): ${errText.slice(0,200)}` });
+      return res.json({ text: `AI error (HTTP ${r.status}): ${errText.slice(0, 200)}` });
     }
 
     const data = await r.json();
-    const text = (data?.choices?.[0]?.message?.content || '').toString().trim()
-      || 'Sorry, I could not generate a reply.';
+    const text =
+      (data?.choices?.[0]?.message?.content || '').toString().trim() ||
+      'Sorry, I could not generate a reply.';
     return res.json({ text });
   } catch (e) {
     return res.json({ text: `Server error: ${e?.message || 'unknown'}` });
