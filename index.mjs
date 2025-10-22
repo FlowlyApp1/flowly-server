@@ -1,4 +1,3 @@
-﻿// server/index.mjs
 import bodyParser from "body-parser";
 import cors from "cors";
 import "dotenv/config";
@@ -18,7 +17,9 @@ app.use(bodyParser.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// ===== Helpers ===============================================================
+/* ============================================================================
+ * Helpers
+ * ==========================================================================*/
 function withTimeout(promise, ms = 25000, label = "operation") {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(`${label} timed out after ${ms}ms`), ms);
@@ -43,15 +44,21 @@ function sendError(res, e, status = 500) {
   res.status(e?.response?.status || status).json({ error: toText(msg) });
 }
 
-// ===== Plaid setup ===========================================================
-const PLAID_ENV = (process.env.PLAID_ENV || "sandbox").trim();
+function sendPlaidError(res, err, fallbackStatus = 500) {
+  const details = err?.response?.data || { message: String(err?.message || err) };
+  console.error("Plaid error →", details);
+  res.status(err?.response?.status || fallbackStatus).json(details);
+}
+
+/* ============================================================================
+ * Plaid setup
+ * ==========================================================================*/
+const PLAID_ENV = (process.env.PLAID_ENV || "sandbox").trim(); // 'sandbox' | 'development' | 'production'
 const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions")
   .split(",").map(s => s.trim()).filter(Boolean);
 
 const PLAID_REDIRECT_URI = (process.env.PLAID_REDIRECT_URI || "").trim();
 const ANDROID_PACKAGE_NAME = (process.env.ANDROID_PACKAGE_NAME || "").trim();
-const USE_ANDROID = !!ANDROID_PACKAGE_NAME;
-const USE_REDIRECT = !!PLAID_REDIRECT_URI && !USE_ANDROID;
 
 const plaidConfig = new Configuration({
   basePath: PlaidEnvironments[PLAID_ENV],
@@ -66,30 +73,30 @@ const plaidConfig = new Configuration({
 });
 const plaid = new PlaidApi(plaidConfig);
 
-function sendPlaidError(res, err, fallbackStatus = 500) {
-  const details = err?.response?.data || { message: String(err?.message || err) };
-  console.error("Plaid error →", details);
-  res.status(err?.response?.status || fallbackStatus).json(details);
-}
-
-// ===== Diagnostics ===========================================================
+/* ============================================================================
+ * Diagnostics
+ * ==========================================================================*/
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
+
 app.get("/api/env-check", (_req, res) =>
   res.json({
     env: PLAID_ENV,
     products: PRODUCTS,
     hasClientId: !!process.env.PLAID_CLIENT_ID,
     hasSecret: !!process.env.PLAID_SECRET,
-    using: USE_ANDROID
-      ? `android_package_name=${ANDROID_PACKAGE_NAME}`
-      : USE_REDIRECT
-      ? `redirect_uri=${PLAID_REDIRECT_URI}`
-      : "(none)",
+    redirectUri: PLAID_REDIRECT_URI || null,
+    androidPackageName: ANDROID_PACKAGE_NAME || null,
+    using:
+      ANDROID_PACKAGE_NAME
+        ? `android_package_name=${ANDROID_PACKAGE_NAME}`
+        : (PLAID_REDIRECT_URI ? `redirect_uri=${PLAID_REDIRECT_URI}` : "(none)"),
     hasOpenAI: !!(process.env.OPENAI_API_KEY || process.env.EXPO_PUBLIC_OPENAI_API_KEY),
   })
 );
 
-// ===== Chat endpoints ========================================================
+/* ============================================================================
+ * (Optional) Chat endpoints
+ * ==========================================================================*/
 app.post("/api/ai/chat-echo", (req, res) => {
   const { text } = req.body || {};
   return res.json({ text: `ECHO: ${text ?? ""}`, usedScopes: {} });
@@ -136,38 +143,81 @@ app.post("/api/ai/chat", async (req, res) => {
   }
 });
 
-// ===== Plaid routes ==========================================================
-// Create Link Token
+/* ============================================================================
+ * Plaid routes
+ * ==========================================================================*/
+
+// Create Link Token — decide per request based on platform
 app.post("/api/create_link_token", async (req, res) => {
-  const client_user_id = String(req.body?.userId || "demo-user");
-  const base = {
-    user: { client_user_id },
-    client_name: "Flowly",
-    products: PRODUCTS,
-    country_codes: ["US"],
-    language: "en",
-  };
   try {
-    const resp = await plaid.linkTokenCreate({
-      ...base,
-      ...(USE_ANDROID ? { android_package_name: ANDROID_PACKAGE_NAME } : {}),
-      ...(USE_REDIRECT ? { redirect_uri: PLAID_REDIRECT_URI } : {}),
-    });
-    res.json({ link_token: resp.data.link_token });
+    const client_user_id = String(req.body?.userId || "demo-user");
+    const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
+
+    const base = {
+      user: { client_user_id },
+      client_name: "Flowly",
+      products: PRODUCTS,
+      country_codes: ["US"],
+      language: "en",
+    };
+
+    let extras = {};
+    if (platform === "ios") {
+      if (!PLAID_REDIRECT_URI) {
+        return res.status(400).json({
+          error: "missing_redirect_uri",
+          hint: "Set PLAID_REDIRECT_URI to https://<your-domain>/plaid-oauth",
+        });
+      }
+      extras = { redirect_uri: PLAID_REDIRECT_URI };
+    } else if (platform === "android") {
+      if (!ANDROID_PACKAGE_NAME) {
+        return res.status(400).json({
+          error: "missing_android_package_name",
+          hint: "Set ANDROID_PACKAGE_NAME (e.g. com.seanjones.flowlyapp)",
+        });
+      }
+      extras = { android_package_name: ANDROID_PACKAGE_NAME };
+    } else {
+      return res.status(400).json({
+        error: "invalid_platform",
+        hint: "Pass platform as 'ios' or 'android'.",
+      });
+    }
+
+    const resp = await plaid.linkTokenCreate({ ...base, ...extras });
+    res.json({ link_token: resp.data.link_token, platform });
   } catch (e) {
     const code = e?.response?.data?.error_code;
+
     if (code === "INVALID_FIELD") {
       try {
-        const fallback = await plaid.linkTokenCreate(base);
+        const client_user_id = String(req.body?.userId || "demo-user");
+        const fallback = await plaid.linkTokenCreate({
+          user: { client_user_id },
+          client_name: "Flowly",
+          products: PRODUCTS,
+          country_codes: ["US"],
+          language: "en",
+        });
         return res.json({ link_token: fallback.data.link_token, fallback: true });
       } catch (e2) { return sendPlaidError(res, e2); }
     }
+
     if (code === "PRODUCTS_NOT_ENABLED") {
       try {
-        const retry = await plaid.linkTokenCreate({ ...base, products: ["balance"] });
+        const client_user_id = String(req.body?.userId || "demo-user");
+        const retry = await plaid.linkTokenCreate({
+          user: { client_user_id },
+          client_name: "Flowly",
+          products: ["balance"],
+          country_codes: ["US"],
+          language: "en",
+        });
         return res.json({ link_token: retry.data.link_token, downgraded_to: "balance" });
       } catch (e3) { return sendPlaidError(res, e3); }
     }
+
     return sendPlaidError(res, e);
   }
 });
@@ -233,7 +283,7 @@ app.get("/api/transactions", async (req, res) => {
   }
 });
 
-// ✅ Accounts (balances)
+// Accounts (balances)
 app.get("/api/accounts", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
@@ -262,7 +312,7 @@ app.get("/api/accounts", async (req, res) => {
   }
 });
 
-// Plaid webhook
+// Webhook (optional)
 app.post("/api/plaid/webhook", async (req, res) => {
   try {
     const { webhook_type, webhook_code, item_id } = req.body || {};
@@ -277,7 +327,9 @@ app.post("/api/plaid/webhook", async (req, res) => {
   }
 });
 
-// Start
+/* ============================================================================
+ * Start
+ * ==========================================================================*/
 app.listen(PORT, () => {
   console.log(`Flowly server running on http://localhost:${PORT}`);
 });
