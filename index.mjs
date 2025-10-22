@@ -166,7 +166,7 @@ app.post("/api/create_link_token", async (req, res) => {
       if (!PLAID_REDIRECT_URI) {
         return res.status(400).json({
           error: "missing_redirect_uri",
-          hint: "Set PLAID_REDIRECT_URI to https://flowly-server-xfdv.onrender.com/plaid-oauth",
+          hint: "Set PLAID_REDIRECT_URI to https://<your-domain>/plaid-oauth",
         });
       }
       extras = { redirect_uri: PLAID_REDIRECT_URI };
