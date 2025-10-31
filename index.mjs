@@ -27,6 +27,7 @@ function withTimeout(promise, ms = 25000, label = "operation") {
     promise(ctrl.signal),
     new Promise((_, rej) => {
       const err = new Error(`${label} timed out`);
+      // @ts-ignore
       err.code = "ETIMEOUT";
       setTimeout(() => rej(err), ms);
     }),
@@ -60,6 +61,10 @@ const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions")
 const PLAID_REDIRECT_URI = (process.env.PLAID_REDIRECT_URI || "").trim();
 const ANDROID_PACKAGE_NAME = (process.env.ANDROID_PACKAGE_NAME || "").trim();
 
+// 🔸 NEW: read your Link customization name for Data Transparency Messaging
+const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim();
+console.log("Using Plaid Link customization =", LINK_CUSTOMIZATION || "(none)");
+
 const plaidConfig = new Configuration({
   basePath: PlaidEnvironments[PLAID_ENV],
   baseOptions: {
@@ -86,6 +91,7 @@ app.get("/api/env-check", (_req, res) =>
     hasSecret: !!process.env.PLAID_SECRET,
     redirectUri: PLAID_REDIRECT_URI || null,
     androidPackageName: ANDROID_PACKAGE_NAME || null,
+    linkCustomization: LINK_CUSTOMIZATION || null, // 👈 NEW: visible check
     using:
       ANDROID_PACKAGE_NAME
         ? `android_package_name=${ANDROID_PACKAGE_NAME}`
@@ -130,6 +136,7 @@ app.post("/api/ai/chat", async (req, res) => {
       if (!r.ok) {
         const body = await r.text().catch(() => "");
         const err = new Error(`Upstream ${r.status} ${r.statusText} ${body}`);
+        // @ts-ignore
         err.status = r.status;
         throw err;
       }
@@ -159,6 +166,7 @@ app.post("/api/create_link_token", async (req, res) => {
       products: PRODUCTS,
       country_codes: ["US"],
       language: "en",
+      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}), // 👈 NEW
     };
 
     let extras = {};
@@ -185,6 +193,13 @@ app.post("/api/create_link_token", async (req, res) => {
       });
     }
 
+    console.log("Creating link token with:", {
+      platform,
+      LINK_CUSTOMIZATION: LINK_CUSTOMIZATION || "(none)",
+      using_redirect: !!extras.redirect_uri,
+      using_android_pkg: !!extras.android_package_name,
+    });
+
     const resp = await plaid.linkTokenCreate({ ...base, ...extras });
     res.json({ link_token: resp.data.link_token, platform });
   } catch (e) {
@@ -199,6 +214,7 @@ app.post("/api/create_link_token", async (req, res) => {
           products: PRODUCTS,
           country_codes: ["US"],
           language: "en",
+          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}), // keep customization on fallback
         });
         return res.json({ link_token: fallback.data.link_token, fallback: true });
       } catch (e2) { return sendPlaidError(res, e2); }
@@ -213,6 +229,7 @@ app.post("/api/create_link_token", async (req, res) => {
           products: ["balance"],
           country_codes: ["US"],
           language: "en",
+          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}), // keep customization
         });
         return res.json({ link_token: retry.data.link_token, downgraded_to: "balance" });
       } catch (e3) { return sendPlaidError(res, e3); }
@@ -298,9 +315,9 @@ app.get("/api/accounts", async (req, res) => {
       type: a.subtype || a.type || undefined,
       balance: Number(
         a.balances?.current ??
-        a.balances?.available ??
-        a.balances?.limit ??
-        0
+          a.balances?.available ??
+          a.balances?.limit ??
+          0
       ),
       mask: a.mask,
       institution: a.official_name || undefined,
