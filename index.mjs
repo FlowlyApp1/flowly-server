@@ -318,7 +318,7 @@ app.get("/api/transactions", async (req, res) => {
     let added = [];
     let hasMore = true;
 
-    // 1) Incremental sync
+    // 1) Incremental sync (count capped at 500)
     while (hasMore) {
       const sync = await plaid.transactionsSync({
         access_token: user.access_token,
@@ -343,7 +343,7 @@ app.get("/api/transactions", async (req, res) => {
         start_date: toISO(start),
         end_date: toISO(end),
         options: {
-          count: 500,
+          count: 500, // ✅ within [1, 500]
           include_personal_finance_category: true,
         },
       });
@@ -429,8 +429,9 @@ app.post("/api/plaid/webhook", async (req, res) => {
  *  - Returns logo-friendly fields (website/counterparties) used by the app.
  * ==========================================================================*/
 
-/** Fetch a recent window of transactions (180 days), including PFC + counterparties */
-async function fetchRecentTxns(access_token, days = 180, count = 1000) {
+/** Fetch a recent window of transactions (180 days), including PFC + counterparties
+ *  NOTE: `count` must be <= 500 per Plaid. */
+async function fetchRecentTxns(access_token, days = 180, count = 500) {
   const end = new Date();
   const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
 
@@ -439,7 +440,7 @@ async function fetchRecentTxns(access_token, days = 180, count = 1000) {
     start_date: toISO(start),
     end_date: toISO(end),
     options: {
-      count,
+      count, // ✅ capped at 500
       include_personal_finance_category: true,
     },
   });
@@ -465,7 +466,6 @@ const BILL_BRANDS = [
 function looksMonthly(dates) {
   if (dates.length < 2) return false;
   dates.sort((a, b) => new Date(a) - new Date(b));
-  // Check any adjacent pair
   for (let i = 1; i < dates.length; i++) {
     const gap = daysBetween(dates[i - 1], dates[i]);
     if (gap >= 25 && gap <= 35) return true;
@@ -493,7 +493,6 @@ function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
     amount: Math.abs(Number(amount || 0)),
     cycle, // 'monthly' | 'annual'
     nextCharge: cycle === "monthly" ? nextMonthlyFrom(date) : addDays(date, 365),
-    // Logo helpers for the app's LogoBubble:
     website: website || null,
     counterparties: counterparties || undefined,
     alerts: false,
@@ -520,12 +519,11 @@ function merchantMatches(key, list) {
 /** Extract approximate recurring “subscriptions” */
 async function deriveSubscriptions(access_token) {
   const all = await fetchRecentTxns(access_token);
-  const expenses = all.filter((t) => t.amount > 0); // Plaid: positive -> money out (expense)
+  const expenses = all.filter((t) => t.amount > 0);
   const byMerchant = groupByMerchant(expenses);
 
   const out = [];
   for (const [key, group] of byMerchant.entries()) {
-    // Pick rows close in amount and monthly cadence
     const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
     const dates = group.rows.map((r) => r.date);
@@ -535,7 +533,6 @@ async function deriveSubscriptions(access_token) {
     const monthlyish = looksMonthly(dates);
 
     if ((brandHint || monthlyish) && group.rows.length >= 2) {
-      // Latest charge
       const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
       out.push(
         buildItem({
@@ -551,7 +548,6 @@ async function deriveSubscriptions(access_token) {
     }
   }
 
-  // Deduplicate by id and prefer most-recent
   const uniq = new Map();
   for (const s of out) {
     if (!uniq.has(s.id)) uniq.set(s.id, s);
@@ -576,7 +572,6 @@ async function deriveBills(access_token) {
     const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
 
-    // Bills: utilities/telecom/insurance, or consistent monthly charges with utility-like names
     const isBillBrand = merchantMatches(key, BILL_BRANDS);
     const monthlyish = looksMonthly(dates);
 
@@ -596,7 +591,6 @@ async function deriveBills(access_token) {
     }
   }
 
-  // Deduplicate & cap results
   const uniq = new Map();
   for (const b of out) {
     if (!uniq.has(b.id)) uniq.set(b.id, b);
@@ -614,12 +608,11 @@ app.get("/api/subscriptions", async (req, res) => {
     if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
 
     const items = await deriveSubscriptions(user.access_token);
-    // Normalize to the client type (name, amount, cycle, nextCharge, website/counterparties)
     const subs = items.map((s) => ({
       id: s.id,
       name: s.name,
       amount: s.amount,
-      cycle: s.cycle, // 'monthly'
+      cycle: s.cycle,
       nextCharge: s.nextCharge,
       isPaused: false,
       alerts: false,
@@ -645,7 +638,7 @@ app.get("/api/bills", async (req, res) => {
       id: b.id,
       name: b.name,
       amount: b.amount,
-      dueDate: b.nextCharge, // maps to your UI’s "Due" label
+      dueDate: b.nextCharge,
       autopay: false,
       alerts: false,
       website: b.website || null,
