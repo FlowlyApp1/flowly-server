@@ -22,9 +22,27 @@ export const db = getFirestore();
 /** Users → { access_token, item_id, cursor } */
 export const usersCol = db.collection("users");
 
+/**
+ * Upserts the user's Plaid item and clears cursor when the item/access token changes.
+ */
 export async function upsertUserItem({ userId, access_token, item_id }) {
   const ref = usersCol.doc(userId);
-  await ref.set({ access_token, item_id }, { merge: true });
+  const snap = await ref.get();
+  const prev = snap.exists ? snap.data() || {} : {};
+
+  const itemChanged =
+    !prev ||
+    prev.item_id !== item_id ||
+    prev.access_token !== access_token;
+
+  const payload = {
+    access_token,
+    item_id,
+    updatedAt: new Date().toISOString(),
+    ...(itemChanged ? { cursor: null } : {}), // Reset cursor on new/changed item
+  };
+
+  await ref.set(payload, { merge: true });
 }
 
 export async function getUserById(userId) {
