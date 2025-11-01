@@ -1,3 +1,4 @@
+// index.mjs
 import bodyParser from "body-parser";
 import cors from "cors";
 import "dotenv/config";
@@ -22,7 +23,7 @@ const PORT = process.env.PORT || 3000;
  * ==========================================================================*/
 function withTimeout(promise, ms = 25000, label = "operation") {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(`${label} timed out after ${ms}ms`), ms);
+  const timer = setTimeout(() => ctrl.abort(`${label} timed out after ${ms}ms`), ms);
   return Promise.race([
     promise(ctrl.signal),
     new Promise((_, rej) => {
@@ -31,7 +32,7 @@ function withTimeout(promise, ms = 25000, label = "operation") {
       err.code = "ETIMEOUT";
       setTimeout(() => rej(err), ms);
     }),
-  ]).finally(() => clearTimeout(t));
+  ]).finally(() => clearTimeout(timer));
 }
 
 function toText(v) {
@@ -56,12 +57,17 @@ function sendPlaidError(res, err, fallbackStatus = 500) {
  * ==========================================================================*/
 const PLAID_ENV = (process.env.PLAID_ENV || "sandbox").trim(); // 'sandbox' | 'development' | 'production'
 const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions")
-  .split(",").map(s => s.trim()).filter(Boolean);
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
+// IMPORTANT (iOS OAuth): must be your HTTPS page (Render), e.g. https://<domain>/plaid-oauth
 const PLAID_REDIRECT_URI = (process.env.PLAID_REDIRECT_URI || "").trim();
+
+// Android intent verification
 const ANDROID_PACKAGE_NAME = (process.env.ANDROID_PACKAGE_NAME || "").trim();
 
-// 🔸 NEW: read your Link customization name for Data Transparency Messaging
+// Link customization (optional)
 const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim();
 console.log("Using Plaid Link customization =", LINK_CUSTOMIZATION || "(none)");
 
@@ -81,6 +87,7 @@ const plaid = new PlaidApi(plaidConfig);
 /* ============================================================================
  * Diagnostics
  * ==========================================================================*/
+app.get("/", (_req, res) => res.send("Flowly server is running"));
 app.get("/api/health", (_req, res) => res.json({ ok: true, ts: Date.now() }));
 
 app.get("/api/env-check", (_req, res) =>
@@ -91,7 +98,7 @@ app.get("/api/env-check", (_req, res) =>
     hasSecret: !!process.env.PLAID_SECRET,
     redirectUri: PLAID_REDIRECT_URI || null,
     androidPackageName: ANDROID_PACKAGE_NAME || null,
-    linkCustomization: LINK_CUSTOMIZATION || null, // 👈 NEW: visible check
+    linkCustomization: LINK_CUSTOMIZATION || null,
     using:
       ANDROID_PACKAGE_NAME
         ? `android_package_name=${ANDROID_PACKAGE_NAME}`
@@ -99,6 +106,27 @@ app.get("/api/env-check", (_req, res) =>
     hasOpenAI: !!(process.env.OPENAI_API_KEY || process.env.EXPO_PUBLIC_OPENAI_API_KEY),
   })
 );
+
+/* ============================================================================
+ * OAuth return page
+ * Always bounce into the installed native app via the **flowlyapp://** scheme.
+ * ==========================================================================*/
+app.get("/plaid-oauth", (req, res) => {
+  const scheme = "flowlyapp"; // native app’s custom URL scheme
+  const qs =
+    Object.keys(req.query || {}).length
+      ? `?${new URLSearchParams(req.query).toString()}`
+      : "";
+  const appDeeplink = `${scheme}://plaid-oauth${qs}`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!doctype html>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Returning to Flowly…</title>
+<p>Returning to Flowly…</p>
+<script>location.replace(${JSON.stringify(appDeeplink)});</script>
+<meta http-equiv="refresh" content="0;url='${appDeeplink}'">`);
+});
 
 /* ============================================================================
  * (Optional) Chat endpoints
@@ -154,11 +182,17 @@ app.post("/api/ai/chat", async (req, res) => {
  * Plaid routes
  * ==========================================================================*/
 
-// Create Link Token — decide per request based on platform
+// Create Link Token — client must pass { platform: 'ios' | 'android' }
 app.post("/api/create_link_token", async (req, res) => {
   try {
     const client_user_id = String(req.body?.userId || "demo-user");
     const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
+    if (platform !== "ios" && platform !== "android") {
+      return res.status(400).json({
+        error: "invalid_platform",
+        hint: "Pass platform as 'ios' or 'android'.",
+      });
+    }
 
     const base = {
       user: { client_user_id },
@@ -166,19 +200,20 @@ app.post("/api/create_link_token", async (req, res) => {
       products: PRODUCTS,
       country_codes: ["US"],
       language: "en",
-      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}), // 👈 NEW
+      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
+    // Platform-specific extras
     let extras = {};
     if (platform === "ios") {
       if (!PLAID_REDIRECT_URI) {
         return res.status(400).json({
           error: "missing_redirect_uri",
-          hint: "Set PLAID_REDIRECT_URI to https://<your-domain>/plaid-oauth",
+          hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
         });
       }
       extras = { redirect_uri: PLAID_REDIRECT_URI };
-    } else if (platform === "android") {
+    } else {
       if (!ANDROID_PACKAGE_NAME) {
         return res.status(400).json({
           error: "missing_android_package_name",
@@ -186,11 +221,6 @@ app.post("/api/create_link_token", async (req, res) => {
         });
       }
       extras = { android_package_name: ANDROID_PACKAGE_NAME };
-    } else {
-      return res.status(400).json({
-        error: "invalid_platform",
-        hint: "Pass platform as 'ios' or 'android'.",
-      });
     }
 
     console.log("Creating link token with:", {
@@ -205,6 +235,7 @@ app.post("/api/create_link_token", async (req, res) => {
   } catch (e) {
     const code = e?.response?.data?.error_code;
 
+    // Fallbacks for common dashboard/config errors
     if (code === "INVALID_FIELD") {
       try {
         const client_user_id = String(req.body?.userId || "demo-user");
@@ -214,10 +245,12 @@ app.post("/api/create_link_token", async (req, res) => {
           products: PRODUCTS,
           country_codes: ["US"],
           language: "en",
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}), // keep customization on fallback
+          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
         });
         return res.json({ link_token: fallback.data.link_token, fallback: true });
-      } catch (e2) { return sendPlaidError(res, e2); }
+      } catch (e2) {
+        return sendPlaidError(res, e2);
+      }
     }
 
     if (code === "PRODUCTS_NOT_ENABLED") {
@@ -229,10 +262,12 @@ app.post("/api/create_link_token", async (req, res) => {
           products: ["balance"],
           country_codes: ["US"],
           language: "en",
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}), // keep customization
+          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
         });
         return res.json({ link_token: retry.data.link_token, downgraded_to: "balance" });
-      } catch (e3) { return sendPlaidError(res, e3); }
+      } catch (e3) {
+        return sendPlaidError(res, e3);
+      }
     }
 
     return sendPlaidError(res, e);
@@ -256,7 +291,7 @@ app.post("/api/exchange_public_token", async (req, res) => {
   }
 });
 
-// Transactions via /transactions/sync
+// Transactions via /transactions/sync with one-time backfill
 app.get("/api/transactions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
@@ -267,6 +302,7 @@ app.get("/api/transactions", async (req, res) => {
     let added = [];
     let hasMore = true;
 
+    // 1) Incremental sync
     while (hasMore) {
       const sync = await plaid.transactionsSync({
         access_token: user.access_token,
@@ -275,10 +311,33 @@ app.get("/api/transactions", async (req, res) => {
       });
       added = added.concat(sync.data.added || []);
       cursor = sync.data.next_cursor;
-      hasMore = sync.data.has_more;
+      hasMore = !!sync.data.has_more;
     }
+
+    // Persist latest cursor
     await setUserCursor(userId, cursor);
 
+    // 2) Backfill if first sync returned nothing
+    if (added.length === 0) {
+      const end = new Date();
+      const start = new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000); // last 90 days
+      const toISO = (d) =>
+        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+      const resp = await plaid.transactionsGet({
+        access_token: user.access_token,
+        start_date: toISO(start),
+        end_date: toISO(end),
+        options: {
+          count: 500,
+          include_personal_finance_category: true,
+        },
+      });
+
+      added = resp.data.transactions || [];
+    }
+
+    // 3) Normalize shape expected by the app
     const txns = added.map((t) => {
       const expense = t.amount > 0;
       const primary = t.personal_finance_category?.primary?.toLowerCase() || "uncategorized";
