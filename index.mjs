@@ -384,6 +384,11 @@ app.get("/api/accounts", async (req, res) => {
 
     res.json({ accounts });
   } catch (e) {
+    const code = e?.response?.data?.error_code || e?.error_code;
+    if (code === "PRODUCT_NOT_READY") {
+      // Tell the app: “still preparing; try again soon”
+      return res.status(202).json({ pending: true });
+    }
     return sendPlaidError(res, e);
   }
 });
