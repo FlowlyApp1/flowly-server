@@ -52,6 +52,22 @@ function sendPlaidError(res, err, fallbackStatus = 500) {
   res.status(err?.response?.status || fallbackStatus).json(details);
 }
 
+/* Small date helpers */
+const toISO = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+const daysBetween = (a, b) => {
+  const da = typeof a === "string" ? new Date(a) : a;
+  const db = typeof b === "string" ? new Date(b) : b;
+  return Math.round((db - da) / 86400000);
+};
+
+const addDays = (d, n) => {
+  const dt = new Date(typeof d === "string" ? d : d.getTime());
+  dt.setDate(dt.getDate() + n);
+  return toISO(dt);
+};
+
 /* ============================================================================
  * Plaid setup
  * ==========================================================================*/
@@ -321,8 +337,6 @@ app.get("/api/transactions", async (req, res) => {
     if (added.length === 0) {
       const end = new Date();
       const start = new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000); // last 90 days
-      const toISO = (d) =>
-        `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
       const resp = await plaid.transactionsGet({
         access_token: user.access_token,
@@ -405,6 +419,242 @@ app.post("/api/plaid/webhook", async (req, res) => {
   } catch (e) {
     console.error("webhook error", e);
     res.status(200).json({ ok: true });
+  }
+});
+
+/* ============================================================================
+ * NEW: lightweight recurring detection for subscriptions & bills
+ *  - No extra Plaid products required.
+ *  - Heuristics over the last ~180 days of transactions.
+ *  - Returns logo-friendly fields (website/counterparties) used by the app.
+ * ==========================================================================*/
+
+/** Fetch a recent window of transactions (180 days), including PFC + counterparties */
+async function fetchRecentTxns(access_token, days = 180, count = 1000) {
+  const end = new Date();
+  const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
+
+  const resp = await plaid.transactionsGet({
+    access_token,
+    start_date: toISO(start),
+    end_date: toISO(end),
+    options: {
+      count,
+      include_personal_finance_category: true,
+    },
+  });
+
+  return resp.data.transactions || [];
+}
+
+/** Basic sets of brands to hint classification */
+const SUB_BRANDS = [
+  "netflix","spotify","hulu","disney","hbomax","max","youtube","youtube premium","apple.com/bill",
+  "adobe","microsoft","onedrive","dropbox","icloud","prime","audible","google","openai",
+  "canva","notion","github","xbox","playstation","nintendo","crunchyroll","pandora","paramount",
+  "peacock","showtime","headspace","calm","duolingo","uber one","lyft pink"
+];
+
+const BILL_BRANDS = [
+  "xfinity","comcast","verizon","at&t","att","t-mobile","tmobile","spectrum","wow internet",
+  "geico","state farm","progressive","allstate","liberty mutual","usaa",
+  "edison","pg&e","pge","con edison","coned","duke energy","fpl","water","utilities","utility"
+];
+
+/** Decide if two dates look monthly-ish (25–35 days apart) */
+function looksMonthly(dates) {
+  if (dates.length < 2) return false;
+  dates.sort((a, b) => new Date(a) - new Date(b));
+  // Check any adjacent pair
+  for (let i = 1; i < dates.length; i++) {
+    const gap = daysBetween(dates[i - 1], dates[i]);
+    if (gap >= 25 && gap <= 35) return true;
+  }
+  return false;
+}
+
+/** Choose next charge date by adding ~30 days to the latest date */
+function nextMonthlyFrom(lastISO) {
+  return addDays(lastISO, 30);
+}
+
+/** Normalize website (from transaction or counterparty) */
+function pickWebsite(t) {
+  if (t.website) return t.website;
+  const cp = Array.isArray(t.counterparties) ? t.counterparties[0] : null;
+  return cp?.website || null;
+}
+
+/** Build normalized item for UI */
+function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
+  return {
+    id,
+    name,
+    amount: Math.abs(Number(amount || 0)),
+    cycle, // 'monthly' | 'annual'
+    nextCharge: cycle === "monthly" ? nextMonthlyFrom(date) : addDays(date, 365),
+    // Logo helpers for the app's LogoBubble:
+    website: website || null,
+    counterparties: counterparties || undefined,
+    alerts: false,
+  };
+}
+
+/** Group transactions by merchant (case-insensitive) */
+function groupByMerchant(txns) {
+  const map = new Map();
+  for (const t of txns) {
+    const merch = (t.merchant_name || t.name || "Unknown").trim();
+    const key = merch.toLowerCase();
+    if (!map.has(key)) map.set(key, { name: merch, rows: [] });
+    map.get(key).rows.push(t);
+  }
+  return map;
+}
+
+/** Simple classifier: is this merchant likely a subscription/bill brand? */
+function merchantMatches(key, list) {
+  return list.some((brand) => key.includes(brand));
+}
+
+/** Extract approximate recurring “subscriptions” */
+async function deriveSubscriptions(access_token) {
+  const all = await fetchRecentTxns(access_token);
+  const expenses = all.filter((t) => t.amount > 0); // Plaid: positive -> money out (expense)
+  const byMerchant = groupByMerchant(expenses);
+
+  const out = [];
+  for (const [key, group] of byMerchant.entries()) {
+    // Pick rows close in amount and monthly cadence
+    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
+    const median = amounts[Math.floor(amounts.length / 2)] || 0;
+    const dates = group.rows.map((r) => r.date);
+
+    const name = group.name;
+    const brandHint = merchantMatches(key, SUB_BRANDS);
+    const monthlyish = looksMonthly(dates);
+
+    if ((brandHint || monthlyish) && group.rows.length >= 2) {
+      // Latest charge
+      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+      out.push(
+        buildItem({
+          id: `${key}:${Math.round(median * 100)}`,
+          name,
+          amount: median,
+          date: latest.date,
+          cycle: "monthly",
+          website: pickWebsite(latest),
+          counterparties: latest.counterparties,
+        })
+      );
+    }
+  }
+
+  // Deduplicate by id and prefer most-recent
+  const uniq = new Map();
+  for (const s of out) {
+    if (!uniq.has(s.id)) uniq.set(s.id, s);
+    else {
+      const a = uniq.get(s.id);
+      if (new Date(s.nextCharge) > new Date(a.nextCharge)) uniq.set(s.id, s);
+    }
+  }
+  return Array.from(uniq.values()).slice(0, 50);
+}
+
+/** Extract approximate recurring “bills” */
+async function deriveBills(access_token) {
+  const all = await fetchRecentTxns(access_token);
+  const expenses = all.filter((t) => t.amount > 0);
+  const byMerchant = groupByMerchant(expenses);
+
+  const out = [];
+  for (const [key, group] of byMerchant.entries()) {
+    const name = group.name;
+    const dates = group.rows.map((r) => r.date);
+    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
+    const median = amounts[Math.floor(amounts.length / 2)] || 0;
+
+    // Bills: utilities/telecom/insurance, or consistent monthly charges with utility-like names
+    const isBillBrand = merchantMatches(key, BILL_BRANDS);
+    const monthlyish = looksMonthly(dates);
+
+    if ((isBillBrand || monthlyish) && group.rows.length >= 2) {
+      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+      out.push(
+        buildItem({
+          id: `bill:${key}:${Math.round(median * 100)}`,
+          name,
+          amount: median,
+          date: latest.date,
+          cycle: "monthly",
+          website: pickWebsite(latest),
+          counterparties: latest.counterparties,
+        })
+      );
+    }
+  }
+
+  // Deduplicate & cap results
+  const uniq = new Map();
+  for (const b of out) {
+    if (!uniq.has(b.id)) uniq.set(b.id, b);
+  }
+  return Array.from(uniq.values()).slice(0, 50);
+}
+
+/* ===== Routes ===== */
+
+/** Subscriptions */
+app.get("/api/subscriptions", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const items = await deriveSubscriptions(user.access_token);
+    // Normalize to the client type (name, amount, cycle, nextCharge, website/counterparties)
+    const subs = items.map((s) => ({
+      id: s.id,
+      name: s.name,
+      amount: s.amount,
+      cycle: s.cycle, // 'monthly'
+      nextCharge: s.nextCharge,
+      isPaused: false,
+      alerts: false,
+      website: s.website || null,
+      counterparties: s.counterparties || undefined,
+    }));
+
+    res.json({ subscriptions: subs });
+  } catch (e) {
+    return sendPlaidError(res, e);
+  }
+});
+
+/** Bills */
+app.get("/api/bills", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const items = await deriveBills(user.access_token);
+    const bills = items.map((b) => ({
+      id: b.id,
+      name: b.name,
+      amount: b.amount,
+      dueDate: b.nextCharge, // maps to your UI’s "Due" label
+      autopay: false,
+      alerts: false,
+      website: b.website || null,
+      counterparties: b.counterparties || undefined,
+    }));
+
+    res.json({ bills });
+  } catch (e) {
+    return sendPlaidError(res, e);
   }
 });
 
