@@ -166,7 +166,7 @@ app.post("/api/ai/chat", async (req, res) => {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
-        },
+        }),
         body: JSON.stringify({
           model: "gpt-5",
           messages: [
@@ -573,6 +573,51 @@ app.post("/api/create_link_token", async (req, res) => {
       }
     }
 
+    return sendPlaidError(res, e);
+  }
+});
+
+/* ===== 🆕 Update-Mode Link Token to add recurring_transactions to existing items ===== */
+app.post("/api/create_update_mode_link_token", async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || "demo-user");
+    const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
+
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const base = {
+      user: { client_user_id: userId },
+      client_name: "Flowly",
+      country_codes: ["US"],
+      language: "en",
+      access_token: user.access_token,
+      additional_required_products: ["recurring_transactions"],
+      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+    };
+
+    let extras = {};
+    if (platform === "ios") {
+      if (!PLAID_REDIRECT_URI) {
+        return res.status(400).json({
+          error: "missing_redirect_uri",
+          hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
+        });
+      }
+      extras = { redirect_uri: PLAID_REDIRECT_URI };
+    } else if (platform === "android") {
+      if (!ANDROID_PACKAGE_NAME) {
+        return res.status(400).json({
+          error: "missing_android_package_name",
+          hint: "Set ANDROID_PACKAGE_NAME (e.g. com.seanjones.flowlyapp)",
+        });
+      }
+      extras = { android_package_name: ANDROID_PACKAGE_NAME };
+    }
+
+    const resp = await plaid.linkTokenCreate({ ...base, ...extras });
+    res.json({ link_token: resp.data.link_token, platform });
+  } catch (e) {
     return sendPlaidError(res, e);
   }
 });
