@@ -72,7 +72,7 @@ const addDays = (d, n) => {
  * Plaid setup
  * ==========================================================================*/
 const PLAID_ENV = (process.env.PLAID_ENV || "sandbox").trim(); // 'sandbox' | 'development' | 'production'
-const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions")
+const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions,recurring_transactions")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
@@ -195,7 +195,294 @@ app.post("/api/ai/chat", async (req, res) => {
 });
 
 /* ============================================================================
- * Plaid routes
+ * ONE-PULL CORE (cache + single normalized fetch)
+ * ==========================================================================*/
+
+// 60s in-memory cache: prevents bursty re-requests from multiple tabs/views
+const TXN_CACHE = new Map(); // key: userId -> { ts: number, txns: NormalizedTxn[] }
+const CACHE_TTL_MS = 60_000;
+
+/** Normalize a Plaid transaction into the shape your app expects. */
+function normalizeTxn(t) {
+  const expense = t.amount > 0;
+  const primary = t.personal_finance_category?.primary?.toLowerCase() || "uncategorized";
+  return {
+    id: t.transaction_id,
+    date: t.date,
+    amount: expense ? -Math.abs(t.amount) : Math.abs(t.amount),
+    categoryId: primary,
+    merchant: t.merchant_name || t.name || "Transaction",
+    type: expense ? "expense" : "income",
+    website: t.website,
+    counterparties: t.counterparties,
+  };
+}
+
+/** Single place that talks to Plaid for transactions, then caches the normalized list. */
+async function getAllTransactionsOnce({ userId, access_token }) {
+  const hit = TXN_CACHE.get(userId);
+  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
+    return hit.txns;
+  }
+
+  // 1) incremental sync
+  let cursor = await getCursor(userId);
+  let added = [];
+  let hasMore = true;
+
+  while (hasMore) {
+    const sync = await plaid.transactionsSync({
+      access_token,
+      cursor: cursor || undefined,
+      count: 500,
+    });
+    added = added.concat(sync.data.added || []);
+    cursor = sync.data.next_cursor;
+    hasMore = !!sync.data.has_more;
+  }
+
+  // persist next cursor
+  await setUserCursor(userId, cursor);
+
+  // 2) backfill if needed
+  if (added.length === 0) {
+    const end = new Date();
+    const start = new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000);
+    const resp = await plaid.transactionsGet({
+      access_token,
+      start_date: toISO(start),
+      end_date: toISO(end),
+      options: { count: 500, include_personal_finance_category: true },
+    });
+    added = resp.data.transactions || [];
+  }
+
+  // 3) normalize
+  const txns = added.map(normalizeTxn);
+
+  TXN_CACHE.set(userId, { ts: Date.now(), txns });
+  return txns;
+}
+
+/* ============================================================================
+ * Recurring detection (heuristics on NORMALIZED txns — kept for other routes)
+ * ==========================================================================*/
+
+const SUB_BRANDS = [
+  "netflix","spotify","hulu","disney","hbomax","max","youtube","youtube premium","apple.com/bill",
+  "adobe","microsoft","onedrive","dropbox","icloud","prime","audible","google","openai",
+  "canva","notion","github","xbox","playstation","nintendo","crunchyroll","pandora","paramount",
+  "peacock","showtime","headspace","calm","duolingo","uber one","lyft pink"
+];
+
+const BILL_BRANDS = [
+  "xfinity","comcast","verizon","at&t","att","t-mobile","tmobile","spectrum","wow internet",
+  "geico","state farm","progressive","allstate","liberty mutual","usaa",
+  "edison","pg&e","pge","con edison","coned","duke energy","fpl","water","utilities","utility"
+];
+
+function looksMonthly(dates) {
+  if (dates.length < 2) return false;
+  dates.sort((a, b) => new Date(a) - new Date(b));
+  for (let i = 1; i < dates.length; i++) {
+    const gap = daysBetween(dates[i - 1], dates[i]);
+    if (gap >= 25 && gap <= 35) return true;
+  }
+  return false;
+}
+function nextMonthlyFrom(lastISO) { return addDays(lastISO, 30); }
+function pickWebsiteFromNormalized(t) {
+  if (t.website) return t.website;
+  const cp = Array.isArray(t.counterparties) ? t.counterparties[0] : null;
+  return cp?.website || null;
+}
+function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
+  return {
+    id,
+    name,
+    amount: Math.abs(Number(amount || 0)),
+    cycle, // 'monthly' | 'annual'
+    nextCharge: cycle === "monthly" ? nextMonthlyFrom(date) : addDays(date, 365),
+    website: website || null,
+    counterparties: counterparties || undefined,
+    alerts: false,
+  };
+}
+function groupByMerchantNormalized(txns) {
+  const map = new Map();
+  for (const t of txns) {
+    const merch = (t.merchant || "Unknown").trim();
+    const key = merch.toLowerCase();
+    if (!map.has(key)) map.set(key, { name: merch, rows: [] });
+    map.get(key).rows.push(t);
+  }
+  return map;
+}
+function merchantMatches(key, list) {
+  return list.some((brand) => key.includes(brand));
+}
+
+// Derive from NORMALIZED txns (expenses are negative)
+function deriveSubscriptionsFromTxns(txns) {
+  const expenses = txns.filter((t) => t.type === "expense").map((t) => ({ ...t, amount: Math.abs(t.amount) }));
+  const byMerchant = groupByMerchantNormalized(expenses);
+  const out = [];
+
+  for (const [key, group] of byMerchant.entries()) {
+    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
+    const median = amounts[Math.floor(amounts.length / 2)] || 0;
+    const dates = group.rows.map((r) => r.date);
+
+    const name = group.name;
+    const brandHint = merchantMatches(key, SUB_BRANDS);
+    const monthlyish = looksMonthly(dates);
+
+    if ((brandHint || monthlyish) && group.rows.length >= 2) {
+      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+      out.push(
+        buildItem({
+          id: `${key}:${Math.round(median * 100)}`,
+          name,
+          amount: median,
+          date: latest.date,
+          cycle: "monthly",
+          website: pickWebsiteFromNormalized(latest),
+          counterparties: latest.counterparties,
+        })
+      );
+    }
+  }
+
+  const uniq = new Map();
+  for (const s of out) if (!uniq.has(s.id)) uniq.set(s.id, s);
+  return Array.from(uniq.values()).slice(0, 50);
+}
+
+function deriveBillsFromTxns(txns) {
+  const expenses = txns.filter((t) => t.type === "expense").map((t) => ({ ...t, amount: Math.abs(t.amount) }));
+  const byMerchant = groupByMerchantNormalized(expenses);
+  const out = [];
+
+  for (const [key, group] of byMerchant.entries()) {
+    const name = group.name;
+    const dates = group.rows.map((r) => r.date);
+    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
+    const median = amounts[Math.floor(amounts.length / 2)] || 0;
+
+    const isBillBrand = merchantMatches(key, BILL_BRANDS);
+    const monthlyish = looksMonthly(dates);
+
+    if ((isBillBrand || monthlyish) && group.rows.length >= 2) {
+      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+      out.push(
+        buildItem({
+          id: `bill:${key}:${Math.round(median * 100)}`,
+          name,
+          amount: median,
+          date: latest.date,
+          cycle: "monthly",
+          website: pickWebsiteFromNormalized(latest),
+          counterparties: latest.counterparties,
+        })
+      );
+    }
+  }
+
+  const uniq = new Map();
+  for (const b of out) if (!uniq.has(b.id)) uniq.set(b.id, b);
+  return Array.from(uniq.values()).slice(0, 50);
+}
+
+/* ============================================================================
+ * Recurring streams (Plaid product) — cache + helpers
+ * ==========================================================================*/
+
+const STREAMS_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const STREAMS_CACHE = new Map(); // key: userId -> { ts, streams }
+
+// Helper: map frequency → days + cycle label
+function freqToInfo(freq) {
+  const f = String(freq || "").toUpperCase();
+  if (f === "WEEKLY") return { days: 7, cycle: "monthly" };
+  if (f === "BIWEEKLY") return { days: 14, cycle: "monthly" };
+  if (f === "SEMI_MONTHLY") return { days: 15, cycle: "monthly" };
+  if (f === "MONTHLY") return { days: 30, cycle: "monthly" };
+  if (f === "QUARTERLY") return { days: 90, cycle: "monthly" };
+  if (f === "ANNUALLY" || f === "YEARLY") return { days: 365, cycle: "annual" };
+  return { days: 30, cycle: "monthly" };
+}
+
+function classifyStream(s) {
+  const name = (s.merchant_name || s.description || "").toLowerCase();
+  const pfcPrimary = s.personal_finance_category?.primary?.toLowerCase?.() || "";
+  const categories = (Array.isArray(s.category) ? s.category : []).map((c) => String(c).toLowerCase());
+  const freq = String(s.frequency || "").toUpperCase();
+
+  // Name hints
+  const subscriptionHints = [
+    "netflix","hulu","disney","spotify","youtube","openai","adobe",
+    "dropbox","onedrive","icloud","prime","audible","canva","notion",
+    "xbox","playstation","paramount","peacock","pandora","crunchyroll",
+  ];
+  const billHints = [
+    "xfinity","comcast","verizon","t-mobile","tmobile","at&t","att",
+    "spectrum","geico","state farm","progressive","usaa","allstate",
+    "mortgage","rent","loan","utilities","utility","power","electric",
+    "water","gas","energy","duke energy","fpl","edison","pge","coned",
+  ];
+
+  const nameHas = (arr) => arr.some((kw) => name.includes(kw));
+  const catHas = (kw) => categories.some((c) => c.includes(kw));
+  const monthlyish = ["WEEKLY","BIWEEKLY","SEMI_MONTHLY","MONTHLY","QUARTERLY","ANNUALLY","YEARLY"].includes(freq);
+
+  // Strong signals from PFC if present
+  const pfcLooksSubscription =
+    pfcPrimary.includes("subscription") || pfcPrimary.includes("entertainment");
+  const pfcLooksBill =
+    pfcPrimary.includes("services") ||
+    pfcPrimary.includes("telecommunication") ||
+    pfcPrimary.includes("insurance") ||
+    pfcPrimary.includes("rent") ||
+    pfcPrimary.includes("loan") ||
+    pfcPrimary.includes("utilities");
+
+  const looksBill =
+    pfcLooksBill ||
+    nameHas(billHints) ||
+    catHas("utilities") ||
+    catHas("telecommunication") ||
+    catHas("insurance") ||
+    catHas("service") ||
+    catHas("mortgage") ||
+    catHas("rent") ||
+    catHas("loan");
+
+  const looksSubscription =
+    pfcLooksSubscription ||
+    (monthlyish && (nameHas(subscriptionHints) || catHas("subscription") || catHas("entertainment")));
+
+  if (looksBill && !looksSubscription) return "bill";
+  if (looksSubscription && !looksBill) return "subscription";
+  if (nameHas(subscriptionHints)) return "subscription";
+  if (nameHas(billHints)) return "bill";
+  // Default lean subscriptions (safer UX; bills should be specific)
+  return "subscription";
+}
+
+const toDollars = (n) => Math.round(Number(n || 0) * 100) / 100;
+
+async function getRecurringStreamsOnce({ userId, access_token }) {
+  const hit = STREAMS_CACHE.get(userId);
+  if (hit && Date.now() - hit.ts < STREAMS_CACHE_TTL) return hit.streams;
+
+  const r = await plaid.recurringTransactionsGet({ access_token });
+  const streams = r.data?.streams || [];
+  STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
+  return streams;
+}
+
+/* ============================================================================
+ * Plaid routes (reuse ONE-PULL core; subs/bills now use streams)
  * ==========================================================================*/
 
 // Create Link Token — client must pass { platform: 'ios' | 'android' }
@@ -307,73 +594,21 @@ app.post("/api/exchange_public_token", async (req, res) => {
   }
 });
 
-// Transactions via /transactions/sync with one-time backfill
+// Transactions (now reuses the cached single pull)
 app.get("/api/transactions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
     if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
 
-    let cursor = await getCursor(userId);
-    let added = [];
-    let hasMore = true;
-
-    // 1) Incremental sync (count capped at 500)
-    while (hasMore) {
-      const sync = await plaid.transactionsSync({
-        access_token: user.access_token,
-        cursor: cursor || undefined,
-        count: 500,
-      });
-      added = added.concat(sync.data.added || []);
-      cursor = sync.data.next_cursor;
-      hasMore = !!sync.data.has_more;
-    }
-
-    // Persist latest cursor
-    await setUserCursor(userId, cursor);
-
-    // 2) Backfill if first sync returned nothing
-    if (added.length === 0) {
-      const end = new Date();
-      const start = new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000); // last 90 days
-
-      const resp = await plaid.transactionsGet({
-        access_token: user.access_token,
-        start_date: toISO(start),
-        end_date: toISO(end),
-        options: {
-          count: 500, // ✅ within [1, 500]
-          include_personal_finance_category: true,
-        },
-      });
-
-      added = resp.data.transactions || [];
-    }
-
-    // 3) Normalize shape expected by the app
-    const txns = added.map((t) => {
-      const expense = t.amount > 0;
-      const primary = t.personal_finance_category?.primary?.toLowerCase() || "uncategorized";
-      return {
-        id: t.transaction_id,
-        date: t.date,
-        amount: expense ? -Math.abs(t.amount) : Math.abs(t.amount),
-        categoryId: primary,
-        merchant: t.merchant_name || t.name || "Transaction",
-        type: expense ? "expense" : "income",
-        website: t.website,
-        counterparties: t.counterparties,
-      };
-    });
-
+    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
     res.json({ txns });
   } catch (e) {
     return sendPlaidError(res, e);
   }
 });
 
-// Accounts (balances)
+// Accounts (balances) — unchanged
 app.get("/api/accounts", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
@@ -400,7 +635,6 @@ app.get("/api/accounts", async (req, res) => {
   } catch (e) {
     const code = e?.response?.data?.error_code || e?.error_code;
     if (code === "PRODUCT_NOT_READY") {
-      // Tell the app: “still preparing; try again soon”
       return res.status(202).json({ pending: true });
     }
     return sendPlaidError(res, e);
@@ -422,231 +656,125 @@ app.post("/api/plaid/webhook", async (req, res) => {
   }
 });
 
-/* ============================================================================
- * NEW: lightweight recurring detection for subscriptions & bills
- *  - No extra Plaid products required.
- *  - Heuristics over the last ~180 days of transactions.
- *  - Returns logo-friendly fields (website/counterparties) used by the app.
- * ==========================================================================*/
+/* ===== One-shot snapshot (txns + derived subs + derived bills) ===== */
+app.get("/api/budget_snapshot", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
 
-/** Fetch a recent window of transactions (180 days), including PFC + counterparties
- *  NOTE: `count` must be <= 500 per Plaid. */
-async function fetchRecentTxns(access_token, days = 180, count = 500) {
-  const end = new Date();
-  const start = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
+    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
+    const [subs, bills] = await Promise.all([
+      deriveSubscriptionsFromTxns(txns),
+      deriveBillsFromTxns(txns),
+    ]);
 
-  const resp = await plaid.transactionsGet({
-    access_token,
-    start_date: toISO(start),
-    end_date: toISO(end),
-    options: {
-      count, // ✅ capped at 500
-      include_personal_finance_category: true,
-    },
-  });
-
-  return resp.data.transactions || [];
-}
-
-/** Basic sets of brands to hint classification */
-const SUB_BRANDS = [
-  "netflix","spotify","hulu","disney","hbomax","max","youtube","youtube premium","apple.com/bill",
-  "adobe","microsoft","onedrive","dropbox","icloud","prime","audible","google","openai",
-  "canva","notion","github","xbox","playstation","nintendo","crunchyroll","pandora","paramount",
-  "peacock","showtime","headspace","calm","duolingo","uber one","lyft pink"
-];
-
-const BILL_BRANDS = [
-  "xfinity","comcast","verizon","at&t","att","t-mobile","tmobile","spectrum","wow internet",
-  "geico","state farm","progressive","allstate","liberty mutual","usaa",
-  "edison","pg&e","pge","con edison","coned","duke energy","fpl","water","utilities","utility"
-];
-
-/** Decide if two dates look monthly-ish (25–35 days apart) */
-function looksMonthly(dates) {
-  if (dates.length < 2) return false;
-  dates.sort((a, b) => new Date(a) - new Date(b));
-  for (let i = 1; i < dates.length; i++) {
-    const gap = daysBetween(dates[i - 1], dates[i]);
-    if (gap >= 25 && gap <= 35) return true;
+    res.json({
+      txns,
+      subscriptions: subs.map((s) => ({
+        id: s.id,
+        name: s.name,
+        amount: s.amount,
+        cycle: s.cycle,
+        nextCharge: s.nextCharge,
+        isPaused: false,
+        alerts: false,
+        website: s.website || null,
+        counterparties: s.counterparties || undefined,
+      })),
+      bills: bills.map((b) => ({
+        id: b.id,
+        name: b.name,
+        amount: b.amount,
+        dueDate: b.nextCharge,
+        autopay: false,
+        alerts: false,
+        website: b.website || null,
+        counterparties: b.counterparties || undefined,
+      })),
+    });
+  } catch (e) {
+    return sendPlaidError(res, e);
   }
-  return false;
-}
+});
 
-/** Choose next charge date by adding ~30 days to the latest date */
-function nextMonthlyFrom(lastISO) {
-  return addDays(lastISO, 30);
-}
-
-/** Normalize website (from transaction or counterparty) */
-function pickWebsite(t) {
-  if (t.website) return t.website;
-  const cp = Array.isArray(t.counterparties) ? t.counterparties[0] : null;
-  return cp?.website || null;
-}
-
-/** Build normalized item for UI */
-function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
-  return {
-    id,
-    name,
-    amount: Math.abs(Number(amount || 0)),
-    cycle, // 'monthly' | 'annual'
-    nextCharge: cycle === "monthly" ? nextMonthlyFrom(date) : addDays(date, 365),
-    website: website || null,
-    counterparties: counterparties || undefined,
-    alerts: false,
-  };
-}
-
-/** Group transactions by merchant (case-insensitive) */
-function groupByMerchant(txns) {
-  const map = new Map();
-  for (const t of txns) {
-    const merch = (t.merchant_name || t.name || "Unknown").trim();
-    const key = merch.toLowerCase();
-    if (!map.has(key)) map.set(key, { name: merch, rows: [] });
-    map.get(key).rows.push(t);
-  }
-  return map;
-}
-
-/** Simple classifier: is this merchant likely a subscription/bill brand? */
-function merchantMatches(key, list) {
-  return list.some((brand) => key.includes(brand));
-}
-
-/** Extract approximate recurring “subscriptions” */
-async function deriveSubscriptions(access_token) {
-  const all = await fetchRecentTxns(access_token);
-  const expenses = all.filter((t) => t.amount > 0);
-  const byMerchant = groupByMerchant(expenses);
-
-  const out = [];
-  for (const [key, group] of byMerchant.entries()) {
-    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
-    const median = amounts[Math.floor(amounts.length / 2)] || 0;
-    const dates = group.rows.map((r) => r.date);
-
-    const name = group.name;
-    const brandHint = merchantMatches(key, SUB_BRANDS);
-    const monthlyish = looksMonthly(dates);
-
-    if ((brandHint || monthlyish) && group.rows.length >= 2) {
-      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-      out.push(
-        buildItem({
-          id: `${key}:${Math.round(median * 100)}`,
-          name,
-          amount: median,
-          date: latest.date,
-          cycle: "monthly",
-          website: pickWebsite(latest),
-          counterparties: latest.counterparties,
-        })
-      );
-    }
-  }
-
-  const uniq = new Map();
-  for (const s of out) {
-    if (!uniq.has(s.id)) uniq.set(s.id, s);
-    else {
-      const a = uniq.get(s.id);
-      if (new Date(s.nextCharge) > new Date(a.nextCharge)) uniq.set(s.id, s);
-    }
-  }
-  return Array.from(uniq.values()).slice(0, 50);
-}
-
-/** Extract approximate recurring “bills” */
-async function deriveBills(access_token) {
-  const all = await fetchRecentTxns(access_token);
-  const expenses = all.filter((t) => t.amount > 0);
-  const byMerchant = groupByMerchant(expenses);
-
-  const out = [];
-  for (const [key, group] of byMerchant.entries()) {
-    const name = group.name;
-    const dates = group.rows.map((r) => r.date);
-    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
-    const median = amounts[Math.floor(amounts.length / 2)] || 0;
-
-    const isBillBrand = merchantMatches(key, BILL_BRANDS);
-    const monthlyish = looksMonthly(dates);
-
-    if ((isBillBrand || monthlyish) && group.rows.length >= 2) {
-      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
-      out.push(
-        buildItem({
-          id: `bill:${key}:${Math.round(median * 100)}`,
-          name,
-          amount: median,
-          date: latest.date,
-          cycle: "monthly",
-          website: pickWebsite(latest),
-          counterparties: latest.counterparties,
-        })
-      );
-    }
-  }
-
-  const uniq = new Map();
-  for (const b of out) {
-    if (!uniq.has(b.id)) uniq.set(b.id, b);
-  }
-  return Array.from(uniq.values()).slice(0, 50);
-}
-
-/* ===== Routes ===== */
-
-/** Subscriptions */
+/* ===== Subscriptions & Bills via Plaid Recurring Streams ===== */
 app.get("/api/subscriptions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
     if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
 
-    const items = await deriveSubscriptions(user.access_token);
-    const subs = items.map((s) => ({
-      id: s.id,
-      name: s.name,
-      amount: s.amount,
-      cycle: s.cycle,
-      nextCharge: s.nextCharge,
-      isPaused: false,
-      alerts: false,
-      website: s.website || null,
-      counterparties: s.counterparties || undefined,
-    }));
+    const streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
+
+    const subs = [];
+    for (const s of streams) {
+      // Don't filter by a non-existent stream_type; use classifier instead
+      if (classifyStream(s) !== "subscription") continue;
+
+      const { days, cycle } = freqToInfo(s.frequency);
+      const next =
+        s.next_date ||
+        (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
+
+      subs.push({
+        id: s.stream_id,
+        name: s.merchant_name || s.description || "Subscription",
+        amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
+        cycle: cycle === "annual" ? "annual" : "monthly",
+        nextCharge: next,
+        isPaused: s.is_active === false,
+        alerts: false,
+        website: s.website || null,
+        logo_url: s.logo_url || undefined,
+        counterparties: s.counterparties || undefined,
+      });
+    }
 
     res.json({ subscriptions: subs });
   } catch (e) {
+    const code = e?.response?.data?.error_code || e?.error_code;
+    if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
     return sendPlaidError(res, e);
   }
 });
 
-/** Bills */
 app.get("/api/bills", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
     if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
 
-    const items = await deriveBills(user.access_token);
-    const bills = items.map((b) => ({
-      id: b.id,
-      name: b.name,
-      amount: b.amount,
-      dueDate: b.nextCharge,
-      autopay: false,
-      alerts: false,
-      website: b.website || null,
-      counterparties: b.counterparties || undefined,
-    }));
+    const streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
+
+    const bills = [];
+    for (const s of streams) {
+      // Don't filter by a non-existent stream_type; use classifier instead
+      if (classifyStream(s) !== "bill") continue;
+
+      const { days, cycle } = freqToInfo(s.frequency);
+      const next =
+        s.next_date ||
+        (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
+
+      bills.push({
+        id: s.stream_id,
+        name: s.merchant_name || s.description || "Bill",
+        amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
+        dueDate: next,
+        autopay: false,
+        variable: false,
+        alerts: false,
+        website: s.website || null,
+        logo_url: s.logo_url || undefined,
+        counterparties: s.counterparties || undefined,
+      });
+    }
 
     res.json({ bills });
   } catch (e) {
+    const code = e?.response?.data?.error_code || e?.error_code;
+    if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
     return sendPlaidError(res, e);
   }
 });
