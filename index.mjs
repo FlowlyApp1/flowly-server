@@ -498,7 +498,7 @@ function classifyStream(s) {
       }
   
       const base = {
-        user: { client_user_id },
+        user: { client_user_id: userId },
         client_name: "Flowly",
         products: PRODUCTS,
         country_codes: ["US"],
@@ -533,7 +533,9 @@ function classifyStream(s) {
         using_android_pkg: !!extras.android_package_name,
       });
   
-      const resp = await plaid.linkTokenCreate({ ...base, ...extras });
+      const payload = { ...base, ...extras };
+      console.log("linkTokenCreate payload (sanity):", JSON.stringify(payload));
+      const resp = await plaid.linkTokenCreate(payload);
       res.json({ link_token: resp.data.link_token, platform });
     } catch (e) {
       const code = e?.response?.data?.error_code;
