@@ -486,77 +486,52 @@ function classifyStream(s) {
    * ==========================================================================*/
   
   // Create Link Token — client must pass { platform: 'ios' | 'android' }
-  app.post("/api/create_link_token", async (req, res) => {
+  app.post("/api/create_update_mode_link_token", async (req, res) => {
     try {
-      const client_user_id = String(req.body?.userId || "demo-user");
+      const userId = String(req.body?.userId || "demo-user");
       const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
+  
+      const dbUser = await getUserById(userId);
+      if (!dbUser?.access_token) return res.status(400).json({ error: "no_linked_item" });
+  
       if (platform !== "ios" && platform !== "android") {
-        return res.status(400).json({
-          error: "invalid_platform",
-          hint: "Pass platform as 'ios' or 'android'.",
-        });
+        return res.status(400).json({ error: "invalid_platform", hint: "Use 'ios' or 'android'." });
       }
   
+      // Minimal, correct payload for UPDATE mode: user + access_token (+ platform-specific)
       const base = {
         user: { client_user_id: userId },
+        access_token: dbUser.access_token,
         client_name: "Flowly",
-        products: PRODUCTS,
         country_codes: ["US"],
         language: "en",
         ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
       };
   
-      // Platform-specific extras
       let extras = {};
       if (platform === "ios") {
         if (!PLAID_REDIRECT_URI) {
-          return res.status(400).json({
-            error: "missing_redirect_uri",
-            hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
-          });
+          return res.status(400).json({ error: "missing_redirect_uri" });
         }
         extras = { redirect_uri: PLAID_REDIRECT_URI };
       } else {
         if (!ANDROID_PACKAGE_NAME) {
-          return res.status(400).json({
-            error: "missing_android_package_name",
-            hint: "Set ANDROID_PACKAGE_NAME (e.g. com.seanjones.flowlyapp)",
-          });
+          return res.status(400).json({ error: "missing_android_package_name" });
         }
         extras = { android_package_name: ANDROID_PACKAGE_NAME };
       }
   
-      console.log("Creating link token with:", {
-        platform,
-        LINK_CUSTOMIZATION: LINK_CUSTOMIZATION || "(none)",
-        using_redirect: !!extras.redirect_uri,
-        using_android_pkg: !!extras.android_package_name,
-      });
+      const requestPayload = { ...base, ...extras };
   
-      const payload = { ...base, ...extras };
-      console.log("linkTokenCreate payload (sanity):", JSON.stringify(payload));
-      const resp = await plaid.linkTokenCreate(payload);
-      res.json({ link_token: resp.data.link_token, platform });
+      // Debug log so we can verify Plaid sees 'user' in the payload
+      console.log("update-mode linkTokenCreate payload:", JSON.stringify(requestPayload));
+  
+      const resp = await plaid.linkTokenCreate(requestPayload);
+      return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
     } catch (e) {
-      const code = e?.response?.data?.error_code;
-  
-      // Fallbacks for common dashboard/config errors
-      if (code === "INVALID_FIELD") {
-        try {
-          const client_user_id = String(req.body?.userId || "demo-user");
-          const fallback = await plaid.linkTokenCreate({
-            user: { client_user_id },
-            client_name: "Flowly",
-            products: PRODUCTS,
-            country_codes: ["US"],
-            language: "en",
-            ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-          });
-          return res.json({ link_token: fallback.data.link_token, fallback: true });
-        } catch (e2) {
-          return sendPlaidError(res, e2);
-        }
-      }
+      return sendPlaidError(res, e);
+    }
+  });
   
       if (code === "PRODUCTS_NOT_ENABLED") {
         try {
