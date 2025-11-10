@@ -334,7 +334,6 @@ function deriveSubscriptionsFromTxns(txns) {
     const dates = group.rows.map((r) => r.date);
 
     const name = group.name;
-    the:
     const brandHint = merchantMatches(key, SUB_BRANDS);
     const monthlyish = looksMonthly(dates);
 
