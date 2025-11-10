@@ -522,14 +522,14 @@ app.post("/api/create_link_token", async (req, res) => {
       extras = { android_package_name: ANDROID_PACKAGE_NAME };
     }
 
-    console.log("Creating link token with:", {
-      platform,
-      LINK_CUSTOMIZATION: LINK_CUSTOMIZATION || "(none)",
-      using_redirect: !!extras.redirect_uri,
-      using_android_pkg: !!extras.android_package_name,
-    });
+    // Hard guard: never mix ios + android fields in a single payload
+    const payload = { ...base, ...extras };
+    if (platform === "ios" && "android_package_name" in payload) delete payload.android_package_name;
+    if (platform === "android" && "redirect_uri" in payload) delete payload.redirect_uri;
 
-    const resp = await plaid.linkTokenCreate({ ...base, ...extras });
+    console.log("create_link_token payload keys:", Object.keys(payload));
+
+    const resp = await plaid.linkTokenCreate(payload);
     return res.json({ link_token: resp.data.link_token, platform });
   } catch (e) {
     const code = e?.response?.data?.error_code;
@@ -608,7 +608,10 @@ app.post("/api/create_update_mode_link_token", async (req, res) => {
     }
 
     const payload = { ...base, ...extras };
-    console.log("update-mode linkTokenCreate payload:", JSON.stringify(payload));
+    if (platform === "ios" && "android_package_name" in payload) delete payload.android_package_name;
+    if (platform === "android" && "redirect_uri" in payload) delete payload.redirect_uri;
+
+    console.log("create_update_mode_link_token payload keys:", Object.keys(payload));
 
     const resp = await plaid.linkTokenCreate(payload);
     return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
