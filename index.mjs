@@ -166,7 +166,7 @@ app.post("/api/ai/chat", async (req, res) => {
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${apiKey}`,
-        }),
+        }, // <-- fixed: removed stray parenthesis that broke the object
         body: JSON.stringify({
           model: "gpt-5",
           messages: [
@@ -577,7 +577,7 @@ app.post("/api/create_link_token", async (req, res) => {
   }
 });
 
-/* ===== 🆕 Update-Mode Link Token to add recurring_transactions to existing items ===== */
+/** Update-mode Link Token — run once per user to grant 'recurring_transactions' to an existing Item */
 app.post("/api/create_update_mode_link_token", async (req, res) => {
   try {
     const userId = String(req.body?.userId || "demo-user");
@@ -592,6 +592,7 @@ app.post("/api/create_update_mode_link_token", async (req, res) => {
       country_codes: ["US"],
       language: "en",
       access_token: user.access_token,
+      // Ask Plaid to grant this additional product on the existing Item
       additional_required_products: ["recurring_transactions"],
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
@@ -754,7 +755,6 @@ app.get("/api/subscriptions", async (req, res) => {
 
     const subs = [];
     for (const s of streams) {
-      // Don't filter by a non-existent stream_type; use classifier instead
       if (classifyStream(s) !== "subscription") continue;
 
       const { days, cycle } = freqToInfo(s.frequency);
@@ -794,7 +794,6 @@ app.get("/api/bills", async (req, res) => {
 
     const bills = [];
     for (const s of streams) {
-      // Don't filter by a non-existent stream_type; use classifier instead
       if (classifyStream(s) !== "bill") continue;
 
       const { days, cycle } = freqToInfo(s.frequency);
