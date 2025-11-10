@@ -334,6 +334,7 @@ function deriveSubscriptionsFromTxns(txns) {
     const dates = group.rows.map((r) => r.date);
 
     const name = group.name;
+    the:
     const brandHint = merchantMatches(key, SUB_BRANDS);
     const monthlyish = looksMonthly(dates);
 
@@ -418,7 +419,6 @@ function classifyStream(s) {
   const categories = (Array.isArray(s.category) ? s.category : []).map((c) => String(c).toLowerCase());
   const freq = String(s.frequency || "").toUpperCase();
 
-  // Name hints
   const subscriptionHints = [
     "netflix","hulu","disney","spotify","youtube","openai","adobe",
     "dropbox","onedrive","icloud","prime","audible","canva","notion",
@@ -430,375 +430,397 @@ function classifyStream(s) {
     "mortgage","rent","loan","utilities","utility","power","electric",
     "water","gas","energy","duke energy","fpl","edison","pge","coned",
   ];
-  
-    const nameHas = (arr) => arr.some((kw) => name.includes(kw));
-    const catHas = (kw) => categories.some((c) => c.includes(kw));
-    const monthlyish = ["WEEKLY","BIWEEKLY","SEMI_MONTHLY","MONTHLY","QUARTERLY","ANNUALLY","YEARLY"].includes(freq);
-  
-    // Strong signals from PFC if present
-    const pfcLooksSubscription =
-      pfcPrimary.includes("subscription") || pfcPrimary.includes("entertainment");
-    const pfcLooksBill =
-      pfcPrimary.includes("services") ||
-      pfcPrimary.includes("telecommunication") ||
-      pfcPrimary.includes("insurance") ||
-      pfcPrimary.includes("rent") ||
-      pfcPrimary.includes("loan") ||
-      pfcPrimary.includes("utilities");
-  
-    const looksBill =
-      pfcLooksBill ||
-      nameHas(billHints) ||
-      catHas("utilities") ||
-      catHas("telecommunication") ||
-      catHas("insurance") ||
-      catHas("service") ||
-      catHas("mortgage") ||
-      catHas("rent") ||
-      catHas("loan");
-  
-    const looksSubscription =
-      pfcLooksSubscription ||
-      (monthlyish && (nameHas(subscriptionHints) || catHas("subscription") || catHas("entertainment")));
-  
-    if (looksBill && !looksSubscription) return "bill";
-    if (looksSubscription && !looksBill) return "subscription";
-    if (nameHas(subscriptionHints)) return "subscription";
-    if (nameHas(billHints)) return "bill";
-    // Default lean subscriptions (safer UX; bills should be specific)
-    return "subscription";
-  }
-  
-  const toDollars = (n) => Math.round(Number(n || 0) * 100) / 100;
-  
-  async function getRecurringStreamsOnce({ userId, access_token }) {
-    const hit = STREAMS_CACHE.get(userId);
-    if (hit && Date.now() - hit.ts < STREAMS_CACHE_TTL) return hit.streams;
-  
-    const r = await plaid.recurringTransactionsGet({ access_token });
-    const streams = r.data?.streams || [];
-    STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
-    return streams;
-  }
-  
-  /* ============================================================================
-   * Plaid routes (reuse ONE-PULL core; subs/bills now use streams)
-   * ==========================================================================*/
-  
-  // Create Link Token — client must pass { platform: 'ios' | 'android' }
-  app.post("/api/create_update_mode_link_token", async (req, res) => {
-    try {
-      const userId = String(req.body?.userId || "demo-user");
-      const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
-  
-      const dbUser = await getUserById(userId);
-      if (!dbUser?.access_token) return res.status(400).json({ error: "no_linked_item" });
-  
-      if (platform !== "ios" && platform !== "android") {
-        return res.status(400).json({ error: "invalid_platform", hint: "Use 'ios' or 'android'." });
-      }
-  
-      // Minimal, correct payload for UPDATE mode: user + access_token (+ platform-specific)
-      const base = {
-        user: { client_user_id: userId },
-        access_token: dbUser.access_token,
-        client_name: "Flowly",
-        country_codes: ["US"],
-        language: "en",
-        ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-      };
-  
-      let extras = {};
-      if (platform === "ios") {
-        if (!PLAID_REDIRECT_URI) {
-          return res.status(400).json({ error: "missing_redirect_uri" });
-        }
-        extras = { redirect_uri: PLAID_REDIRECT_URI };
-      } else {
-        if (!ANDROID_PACKAGE_NAME) {
-          return res.status(400).json({ error: "missing_android_package_name" });
-        }
-        extras = { android_package_name: ANDROID_PACKAGE_NAME };
-      }
-  
-      const requestPayload = { ...base, ...extras };
-  
-      // Debug log so we can verify Plaid sees 'user' in the payload
-      console.log("update-mode linkTokenCreate payload:", JSON.stringify(requestPayload));
-  
-      const resp = await plaid.linkTokenCreate(requestPayload);
-      return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
-    } catch (e) {
-      return sendPlaidError(res, e);
-    }
-  });
-  
-      if (code === "PRODUCTS_NOT_ENABLED") {
-        try {
-          const client_user_id = String(req.body?.userId || "demo-user");
-          const retry = await plaid.linkTokenCreate({
-            user: { client_user_id },
-            client_name: "Flowly",
-            products: ["balance"],
-            country_codes: ["US"],
-            language: "en",
-            ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-          });
-          return res.json({ link_token: retry.data.link_token, downgraded_to: "balance" });
-        } catch (e3) {
-          return sendPlaidError(res, e3);
-        }
-      }
-  
-      return sendPlaidError(res, e);
-    }
-  });
-  
-  // 🔁 Update-Mode Link Token — let users reconsent / add permissions
-  app.post("/api/create_update_mode_link_token", async (req, res) => {
-    try {
-      const userId = String(req.body?.userId || "demo-user");
-      const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
-  
-      const user = await getUserById(userId);
-      if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
-  
-      if (platform !== "ios" && platform !== "android") {
-        return res.status(400).json({ error: "invalid_platform", hint: "Use 'ios' or 'android'." });
-      }
-  
-      const base = {
-        // NOTE: update mode uses the existing access_token (no products override)
-        access_token: user.access_token,
-        client_name: "Flowly",
-        country_codes: ["US"],
-        language: "en",
-        ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-      };
-  
-      let extras = {};
-      if (platform === "ios") {
-        if (!PLAID_REDIRECT_URI) {
-          return res.status(400).json({ error: "missing_redirect_uri" });
-        }
-        extras = { redirect_uri: PLAID_REDIRECT_URI };
-      } else {
-        if (!ANDROID_PACKAGE_NAME) {
-          return res.status(400).json({ error: "missing_android_package_name" });
-        }
-        extras = { android_package_name: ANDROID_PACKAGE_NAME };
-      }
-  
-      const resp = await plaid.linkTokenCreate({ ...base, ...extras });
-      return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
-    } catch (e) {
-      return sendPlaidError(res, e);
-    }
-  });
-  
-  // Exchange public_token -> access_token
-  app.post("/api/exchange_public_token", async (req, res) => {
-    try {
-      const userId = String(req.body?.userId || "demo-user");
-      const { public_token } = req.body || {};
-      if (!public_token) return res.status(400).json({ error: "missing_public_token" });
-  
-      const r = await plaid.itemPublicTokenExchange({ public_token });
-      const { access_token, item_id } = r.data;
-  
-      await upsertUserItem({ userId, access_token, item_id });
-      res.json({ ok: true, item_id });
-    } catch (e) {
-      return sendPlaidError(res, e);
-    }
-  });
-  
-  // Transactions (now reuses the cached single pull)
-  app.get("/api/transactions", async (req, res) => {
-    try {
-      const userId = String(req.query.userId || "demo-user");
-      const user = await getUserById(userId);
-      if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
-  
-      const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
-      res.json({ txns });
-    } catch (e) {
-      return sendPlaidError(res, e);
-    }
-  });
-  
-  // Accounts (balances) — unchanged
-  app.get("/api/accounts", async (req, res) => {
-    try {
-      const userId = String(req.query.userId || "demo-user");
-      const user = await getUserById(userId);
-      if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
-  
-      const resp = await plaid.accountsBalanceGet({ access_token: user.access_token });
-  
-      const accounts = (resp.data.accounts || []).map((a) => ({
-        id: a.account_id,
-        name: a.name || a.official_name || "Account",
-        type: a.subtype || a.type || undefined,
-        balance: Number(
-          a.balances?.current ??
-            a.balances?.available ??
-            a.balances?.limit ??
-            0
-        ),
-        mask: a.mask,
-        institution: a.official_name || undefined,
-      }));
-  
-      res.json({ accounts });
-    } catch (e) {
-      const code = e?.response?.data?.error_code || e?.error_code;
-      if (code === "PRODUCT_NOT_READY") {
-        return res.status(202).json({ pending: true });
-      }
-      return sendPlaidError(res, e);
-    }
-  });
-  
-  // Webhook (optional)
-  app.post("/api/plaid/webhook", async (req, res) => {
-    try {
-      const { webhook_type, webhook_code, item_id } = req.body || {};
-      if (webhook_type === "TRANSACTIONS" && webhook_code === "SYNC_UPDATES_AVAILABLE") {
-        const userId = await getUserIdByItemId(item_id);
-        console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
-      }
-      res.json({ ok: true });
-    } catch (e) {
-      console.error("webhook error", e);
-      res.status(200).json({ ok: true });
-    }
-  });
-  
-  /* ===== One-shot snapshot (txns + derived subs + derived bills) ===== */
-  app.get("/api/budget_snapshot", async (req, res) => {
-    try {
-      const userId = String(req.query.userId || "demo-user");
-      const user = await getUserById(userId);
-      if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
-  
-      const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
-      const [subs, bills] = await Promise.all([
-        deriveSubscriptionsFromTxns(txns),
-        deriveBillsFromTxns(txns),
-      ]);
-  
-      res.json({
-        txns,
-        subscriptions: subs.map((s) => ({
-          id: s.id,
-          name: s.name,
-          amount: s.amount,
-          cycle: s.cycle,
-          nextCharge: s.nextCharge,
-          isPaused: false,
-          alerts: false,
-          website: s.website || null,
-          counterparties: s.counterparties || undefined,
-        })),
-        bills: bills.map((b) => ({
-          id: b.id,
-          name: b.name,
-          amount: b.amount,
-          dueDate: b.nextCharge,
-          autopay: false,
-          alerts: false,
-          website: b.website || null,
-          counterparties: b.counterparties || undefined,
-        })),
+
+  const nameHas = (arr) => arr.some((kw) => name.includes(kw));
+  const catHas = (kw) => categories.some((c) => c.includes(kw));
+  const monthlyish = ["WEEKLY","BIWEEKLY","SEMI_MONTHLY","MONTHLY","QUARTERLY","ANNUALLY","YEARLY"].includes(freq);
+
+  const pfcLooksSubscription =
+    pfcPrimary.includes("subscription") || pfcPrimary.includes("entertainment");
+  const pfcLooksBill =
+    pfcPrimary.includes("services") ||
+    pfcPrimary.includes("telecommunication") ||
+    pfcPrimary.includes("insurance") ||
+    pfcPrimary.includes("rent") ||
+    pfcPrimary.includes("loan") ||
+    pfcPrimary.includes("utilities");
+
+  const looksBill =
+    pfcLooksBill ||
+    nameHas(billHints) ||
+    catHas("utilities") ||
+    catHas("telecommunication") ||
+    catHas("insurance") ||
+    catHas("service") ||
+    catHas("mortgage") ||
+    catHas("rent") ||
+    catHas("loan");
+
+  const looksSubscription =
+    pfcLooksSubscription ||
+    (monthlyish && (nameHas(subscriptionHints) || catHas("subscription") || catHas("entertainment")));
+
+  if (looksBill && !looksSubscription) return "bill";
+  if (looksSubscription && !looksBill) return "subscription";
+  if (nameHas(subscriptionHints)) return "subscription";
+  if (nameHas(billHints)) return "bill";
+  return "subscription";
+}
+
+const toDollars = (n) => Math.round(Number(n || 0) * 100) / 100;
+
+async function getRecurringStreamsOnce({ userId, access_token }) {
+  const hit = STREAMS_CACHE.get(userId);
+  if (hit && Date.now() - hit.ts < STREAMS_CACHE_TTL) return hit.streams;
+
+  const r = await plaid.recurringTransactionsGet({ access_token });
+  const streams = r.data?.streams || [];
+  STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
+  return streams;
+}
+
+/* ============================================================================
+ * Plaid routes (reuse ONE-PULL core; subs/bills now use streams)
+ * ==========================================================================*/
+
+// Create Link Token — client must pass { platform: 'ios' | 'android' }
+app.post("/api/create_link_token", async (req, res) => {
+  try {
+    const client_user_id = String(req.body?.userId || "demo-user");
+    const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
+    if (platform !== "ios" && platform !== "android") {
+      return res.status(400).json({
+        error: "invalid_platform",
+        hint: "Pass platform as 'ios' or 'android'.",
       });
-    } catch (e) {
-      return sendPlaidError(res, e);
     }
-  });
-  
-  /* ===== Subscriptions & Bills via Plaid Recurring Streams ===== */
-  app.get("/api/subscriptions", async (req, res) => {
-    try {
-      const userId = String(req.query.userId || "demo-user");
-      const user = await getUserById(userId);
-      if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
-  
-      const streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
-  
-      const subs = [];
-      for (const s of streams) {
-        if (classifyStream(s) !== "subscription") continue;
-  
-        const { days, cycle } = freqToInfo(s.frequency);
-        const next =
-          s.next_date ||
-          (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
-  
-        subs.push({
-          id: s.stream_id,
-          name: s.merchant_name || s.description || "Subscription",
-          amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
-          cycle: cycle === "annual" ? "annual" : "monthly",
-          nextCharge: next,
-          isPaused: s.is_active === false,
-          alerts: false,
-          website: s.website || null,
-          logo_url: s.logo_url || undefined,
-          counterparties: s.counterparties || undefined,
+
+    const base = {
+      user: { client_user_id },
+      client_name: "Flowly",
+      products: PRODUCTS,
+      country_codes: ["US"],
+      language: "en",
+      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+    };
+
+    let extras = {};
+    if (platform === "ios") {
+      if (!PLAID_REDIRECT_URI) {
+        return res.status(400).json({
+          error: "missing_redirect_uri",
+          hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
         });
       }
-  
-      res.json({ subscriptions: subs });
-    } catch (e) {
-      const code = e?.response?.data?.error_code || e?.error_code;
-      if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
-      return sendPlaidError(res, e);
-    }
-  });
-  
-  app.get("/api/bills", async (req, res) => {
-    try {
-      const userId = String(req.query.userId || "demo-user");
-      const user = await getUserById(userId);
-      if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
-  
-      const streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
-  
-      const bills = [];
-      for (const s of streams) {
-        if (classifyStream(s) !== "bill") continue;
-  
-        const { days, cycle } = freqToInfo(s.frequency);
-        const next =
-          s.next_date ||
-          (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
-  
-        bills.push({
-          id: s.stream_id,
-          name: s.merchant_name || s.description || "Bill",
-          amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
-          dueDate: next,
-          autopay: false,
-          variable: false,
-          alerts: false,
-          website: s.website || null,
-          logo_url: s.logo_url || undefined,
-          counterparties: s.counterparties || undefined,
+      extras = { redirect_uri: PLAID_REDIRECT_URI };
+    } else {
+      if (!ANDROID_PACKAGE_NAME) {
+        return res.status(400).json({
+          error: "missing_android_package_name",
+          hint: "Set ANDROID_PACKAGE_NAME (e.g. com.seanjones.flowlyapp)",
         });
       }
-  
-      res.json({ bills });
-    } catch (e) {
-      const code = e?.response?.data?.error_code || e?.error_code;
-      if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
-      return sendPlaidError(res, e);
+      extras = { android_package_name: ANDROID_PACKAGE_NAME };
     }
-  });
-  
-  /* ============================================================================
-   * Start
-   * ==========================================================================*/
-  app.listen(PORT, () => {
-    console.log(`Flowly server running on http://localhost:${PORT}`);
-  });
+
+    console.log("Creating link token with:", {
+      platform,
+      LINK_CUSTOMIZATION: LINK_CUSTOMIZATION || "(none)",
+      using_redirect: !!extras.redirect_uri,
+      using_android_pkg: !!extras.android_package_name,
+    });
+
+    const resp = await plaid.linkTokenCreate({ ...base, ...extras });
+    return res.json({ link_token: resp.data.link_token, platform });
+  } catch (e) {
+    const code = e?.response?.data?.error_code;
+
+    if (code === "INVALID_FIELD") {
+      try {
+        const client_user_id = String(req.body?.userId || "demo-user");
+        const fallback = await plaid.linkTokenCreate({
+          user: { client_user_id },
+          client_name: "Flowly",
+          products: PRODUCTS,
+          country_codes: ["US"],
+          language: "en",
+          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+        });
+        return res.json({ link_token: fallback.data.link_token, fallback: true });
+      } catch (e2) {
+        return sendPlaidError(res, e2);
+      }
+    }
+
+    if (code === "PRODUCTS_NOT_ENABLED") {
+      try {
+        const client_user_id = String(req.body?.userId || "demo-user");
+        const retry = await plaid.linkTokenCreate({
+          user: { client_user_id },
+          client_name: "Flowly",
+          products: ["balance"],
+          country_codes: ["US"],
+          language: "en",
+          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+        });
+        return res.json({ link_token: retry.data.link_token, downgraded_to: "balance" });
+      } catch (e3) {
+        return sendPlaidError(res, e3);
+      }
+    }
+
+    return sendPlaidError(res, e);
+  }
+});
+
+// 🔁 Update-Mode Link Token — let users reconsent / add permissions
+app.post("/api/create_update_mode_link_token", async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || "demo-user");
+    const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
+
+    const dbUser = await getUserById(userId);
+    if (!dbUser?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    if (platform !== "ios" && platform !== "android") {
+      return res.status(400).json({ error: "invalid_platform", hint: "Use 'ios' or 'android'." });
+    }
+
+    const base = {
+      user: { client_user_id: userId },
+      access_token: dbUser.access_token,
+      client_name: "Flowly",
+      country_codes: ["US"],
+      language: "en",
+      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+    };
+
+    let extras = {};
+    if (platform === "ios") {
+      if (!PLAID_REDIRECT_URI) {
+        return res.status(400).json({ error: "missing_redirect_uri" });
+      }
+      extras = { redirect_uri: PLAID_REDIRECT_URI };
+    } else {
+      if (!ANDROID_PACKAGE_NAME) {
+        return res.status(400).json({ error: "missing_android_package_name" });
+      }
+      extras = { android_package_name: ANDROID_PACKAGE_NAME };
+    }
+
+    const payload = { ...base, ...extras };
+    console.log("update-mode linkTokenCreate payload:", JSON.stringify(payload));
+
+    const resp = await plaid.linkTokenCreate(payload);
+    return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
+  } catch (e) {
+    return sendPlaidError(res, e);
+  }
+});
+
+// Exchange public_token -> access_token
+app.post("/api/exchange_public_token", async (req, res) => {
+  try {
+    const userId = String(req.body?.userId || "demo-user");
+    const { public_token } = req.body || {};
+    if (!public_token) return res.status(400).json({ error: "missing_public_token" });
+
+    const r = await plaid.itemPublicTokenExchange({ public_token });
+    const { access_token, item_id } = r.data;
+
+    await upsertUserItem({ userId, access_token, item_id });
+    return res.json({ ok: true, item_id });
+  } catch (e) {
+    return sendPlaidError(res, e);
+  }
+});
+
+// Transactions
+app.get("/api/transactions", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
+    return res.json({ txns });
+  } catch (e) {
+    return sendPlaidError(res, e);
+  }
+});
+
+// Accounts (balances)
+app.get("/api/accounts", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const resp = await plaid.accountsBalanceGet({ access_token: user.access_token });
+
+    const accounts = (resp.data.accounts || []).map((a) => ({
+      id: a.account_id,
+      name: a.name || a.official_name || "Account",
+      type: a.subtype || a.type || undefined,
+      balance: Number(
+        a.balances?.current ??
+          a.balances?.available ??
+          a.balances?.limit ??
+          0
+      ),
+      mask: a.mask,
+      institution: a.official_name || undefined,
+    }));
+
+    return res.json({ accounts });
+  } catch (e) {
+    const code = e?.response?.data?.error_code || e?.error_code;
+    if (code === "PRODUCT_NOT_READY") {
+      return res.status(202).json({ pending: true });
+    }
+    return sendPlaidError(res, e);
+  }
+});
+
+// Webhook (optional)
+app.post("/api/plaid/webhook", async (req, res) => {
+  try {
+    const { webhook_type, webhook_code, item_id } = req.body || {};
+    if (webhook_type === "TRANSACTIONS" && webhook_code === "SYNC_UPDATES_AVAILABLE") {
+      const userId = await getUserIdByItemId(item_id);
+      console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("webhook error", e);
+    return res.status(200).json({ ok: true });
+  }
+});
+
+/* ===== One-shot snapshot (txns + derived subs + derived bills) ===== */
+app.get("/api/budget_snapshot", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
+    const [subs, bills] = await Promise.all([
+      deriveSubscriptionsFromTxns(txns),
+      deriveBillsFromTxns(txns),
+    ]);
+
+    return res.json({
+      txns,
+      subscriptions: subs.map((s) => ({
+        id: s.id,
+        name: s.name,
+        amount: s.amount,
+        cycle: s.cycle,
+        nextCharge: s.nextCharge,
+        isPaused: false,
+        alerts: false,
+        website: s.website || null,
+        counterparties: s.counterparties || undefined,
+      })),
+      bills: bills.map((b) => ({
+        id: b.id,
+        name: b.name,
+        amount: b.amount,
+        dueDate: b.nextCharge,
+        autopay: false,
+        alerts: false,
+        website: b.website || null,
+        counterparties: b.counterparties || undefined,
+      })),
+    });
+  } catch (e) {
+    return sendPlaidError(res, e);
+  }
+});
+
+/* ===== Subscriptions & Bills via Plaid Recurring Streams ===== */
+app.get("/api/subscriptions", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
+
+    const subs = [];
+    for (const s of streams) {
+      if (classifyStream(s) !== "subscription") continue;
+
+      const { days, cycle } = freqToInfo(s.frequency);
+      const next =
+        s.next_date ||
+        (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
+
+      subs.push({
+        id: s.stream_id,
+        name: s.merchant_name || s.description || "Subscription",
+        amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
+        cycle: cycle === "annual" ? "annual" : "monthly",
+        nextCharge: next,
+        isPaused: s.is_active === false,
+        alerts: false,
+        website: s.website || null,
+        logo_url: s.logo_url || undefined,
+        counterparties: s.counterparties || undefined,
+      });
+    }
+
+    return res.json({ subscriptions: subs });
+  } catch (e) {
+    const code = e?.response?.data?.error_code || e?.error_code;
+    if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
+    return sendPlaidError(res, e);
+  }
+});
+
+app.get("/api/bills", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "demo-user");
+    const user = await getUserById(userId);
+    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+
+    const streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
+
+    const bills = [];
+    for (const s of streams) {
+      if (classifyStream(s) !== "bill") continue;
+
+      const { days, cycle } = freqToInfo(s.frequency);
+      const next =
+        s.next_date ||
+        (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
+
+      bills.push({
+        id: s.stream_id,
+        name: s.merchant_name || s.description || "Bill",
+        amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
+        dueDate: next,
+        autopay: false,
+        variable: false,
+        alerts: false,
+        website: s.website || null,
+        logo_url: s.logo_url || undefined,
+        counterparties: s.counterparties || undefined,
+      });
+    }
+
+    return res.json({ bills });
+  } catch (e) {
+    const code = e?.response?.data?.error_code || e?.error_code;
+    if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
+    return sendPlaidError(res, e);
+  }
+});
+
+/* ============================================================================
+ * Start
+ * ==========================================================================*/
+app.listen(PORT, () => {
+  console.log(`Flowly server running on http://localhost:${PORT}`);
+});
