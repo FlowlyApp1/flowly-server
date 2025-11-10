@@ -84,7 +84,7 @@ const PLAID_REDIRECT_URI = (process.env.PLAID_REDIRECT_URI || "").trim();
 const ANDROID_PACKAGE_NAME = (process.env.ANDROID_PACKAGE_NAME || "").trim();
 
 // Link customization (optional)
-const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim();
+const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim() || null;
 console.log("Using Plaid Link customization =", LINK_CUSTOMIZATION || "(none)");
 
 const plaidConfig = new Configuration({
@@ -503,6 +503,7 @@ app.post("/api/create_link_token", async (req, res) => {
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
+    // Build extras strictly for ONE flow
     let extras = {};
     if (platform === "ios") {
       if (!PLAID_REDIRECT_URI) {
@@ -522,12 +523,16 @@ app.post("/api/create_link_token", async (req, res) => {
       extras = { android_package_name: ANDROID_PACKAGE_NAME };
     }
 
-    // Hard guard: never mix ios + android fields in a single payload
+    // Final payload & hard sanitization (belt-and-suspenders)
     const payload = { ...base, ...extras };
-    if (platform === "ios" && "android_package_name" in payload) delete payload.android_package_name;
-    if (platform === "android" && "redirect_uri" in payload) delete payload.redirect_uri;
+    if (platform === "ios") {
+      delete payload.android_package_name;
+    } else {
+      delete payload.redirect_uri;
+    }
 
-    console.log("create_link_token payload keys:", Object.keys(payload));
+    // Shallow debug: which keys are present (no secrets)
+    console.log("linkTokenCreate keys:", Object.keys(payload).sort());
 
     const resp = await plaid.linkTokenCreate(payload);
     return res.json({ link_token: resp.data.link_token, platform });
@@ -537,15 +542,21 @@ app.post("/api/create_link_token", async (req, res) => {
     if (code === "INVALID_FIELD") {
       try {
         const client_user_id = String(req.body?.userId || "demo-user");
-        const fallback = await plaid.linkTokenCreate({
+        const fallback = {
           user: { client_user_id },
           client_name: "Flowly",
           products: PRODUCTS,
           country_codes: ["US"],
           language: "en",
           ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-        });
-        return res.json({ link_token: fallback.data.link_token, fallback: true });
+        };
+        // Ensure neither key sneaks in
+        delete fallback.redirect_uri;
+        delete fallback.android_package_name;
+
+        console.log("fallback linkTokenCreate keys:", Object.keys(fallback).sort());
+        const r2 = await plaid.linkTokenCreate(fallback);
+        return res.json({ link_token: r2.data.link_token, fallback: true });
       } catch (e2) {
         return sendPlaidError(res, e2);
       }
@@ -554,15 +565,20 @@ app.post("/api/create_link_token", async (req, res) => {
     if (code === "PRODUCTS_NOT_ENABLED") {
       try {
         const client_user_id = String(req.body?.userId || "demo-user");
-        const retry = await plaid.linkTokenCreate({
+        const retry = {
           user: { client_user_id },
           client_name: "Flowly",
           products: ["balance"],
           country_codes: ["US"],
           language: "en",
           ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-        });
-        return res.json({ link_token: retry.data.link_token, downgraded_to: "balance" });
+        };
+        delete retry.redirect_uri;
+        delete retry.android_package_name;
+
+        console.log("retry linkTokenCreate keys:", Object.keys(retry).sort());
+        const r3 = await plaid.linkTokenCreate(retry);
+        return res.json({ link_token: r3.data.link_token, downgraded_to: "balance" });
       } catch (e3) {
         return sendPlaidError(res, e3);
       }
@@ -586,8 +602,7 @@ app.post("/api/create_update_mode_link_token", async (req, res) => {
     }
 
     const base = {
-      user: { client_user_id: userId },
-      access_token: dbUser.access_token,
+      access_token: dbUser.access_token, // update-mode: no products override
       client_name: "Flowly",
       country_codes: ["US"],
       language: "en",
@@ -608,11 +623,13 @@ app.post("/api/create_update_mode_link_token", async (req, res) => {
     }
 
     const payload = { ...base, ...extras };
-    if (platform === "ios" && "android_package_name" in payload) delete payload.android_package_name;
-    if (platform === "android" && "redirect_uri" in payload) delete payload.redirect_uri;
+    if (platform === "ios") {
+      delete payload.android_package_name;
+    } else {
+      delete payload.redirect_uri;
+    }
 
-    console.log("create_update_mode_link_token payload keys:", Object.keys(payload));
-
+    console.log("update-mode linkTokenCreate keys:", Object.keys(payload).sort());
     const resp = await plaid.linkTokenCreate(payload);
     return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
   } catch (e) {
