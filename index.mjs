@@ -472,7 +472,8 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
   const hit = STREAMS_CACHE.get(userId);
   if (hit && Date.now() - hit.ts < STREAMS_CACHE_TTL) return hit.streams;
 
-  const r = await plaid.recurringTransactionsGet({ access_token });
+  // ✅ Correct Plaid SDK method name for /transactions/recurring/get
+  const r = await plaid.transactionsRecurringGet({ access_token });
   const streams = r.data?.streams || [];
   STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
   return streams;
@@ -705,10 +706,21 @@ app.get("/api/accounts", async (req, res) => {
 app.post("/api/plaid/webhook", async (req, res) => {
   try {
     const { webhook_type, webhook_code, item_id } = req.body || {};
+
     if (webhook_type === "TRANSACTIONS" && webhook_code === "SYNC_UPDATES_AVAILABLE") {
       const userId = await getUserIdByItemId(item_id);
       console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
     }
+
+    // ✅ Clear recurring cache when Plaid signals updates to recurring streams
+    if (webhook_type === "RECURRING_TRANSACTIONS" && webhook_code === "RECURRING_TRANSACTIONS_UPDATE") {
+      const userId = await getUserIdByItemId(item_id);
+      if (userId && STREAMS_CACHE.has(userId)) {
+        STREAMS_CACHE.delete(userId);
+        console.log("Cleared STREAMS_CACHE for user", userId, "due to recurring update");
+      }
+    }
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("webhook error", e);
