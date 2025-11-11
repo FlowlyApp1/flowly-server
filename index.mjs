@@ -1,4 +1,3 @@
-// index.mjs
 import bodyParser from "body-parser";
 import cors from "cors";
 import "dotenv/config";
@@ -198,7 +197,7 @@ app.post("/api/ai/chat", async (req, res) => {
  * ONE-PULL CORE (cache + single normalized fetch)
  * ==========================================================================*/
 
-// 60s in-memory cache: prevents bursty re-requests from multiple tabs/views
+// 60s in-memory cache
 const TXN_CACHE = new Map(); // key: userId -> { ts: number, txns: NormalizedTxn[] }
 const CACHE_TTL_MS = 60_000;
 
@@ -472,8 +471,7 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
   const hit = STREAMS_CACHE.get(userId);
   if (hit && Date.now() - hit.ts < STREAMS_CACHE_TTL) return hit.streams;
 
-  // ✅ Correct Plaid SDK method name
-  const r = await plaid.transactionsRecurringGet({ access_token });
+  const r = await plaid.recurringTransactionsGet({ access_token });
   const streams = r.data?.streams || [];
   STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
   return streams;
@@ -504,8 +502,8 @@ app.post("/api/create_link_token", async (req, res) => {
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
-    // ✅ Build mutually exclusive payloads (no post-merge deletes)
-    let payload;
+    // Build extras strictly for ONE flow
+    let extras = {};
     if (platform === "ios") {
       if (!PLAID_REDIRECT_URI) {
         return res.status(400).json({
@@ -513,7 +511,7 @@ app.post("/api/create_link_token", async (req, res) => {
           hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
         });
       }
-      payload = { ...base, redirect_uri: PLAID_REDIRECT_URI };
+      extras = { redirect_uri: PLAID_REDIRECT_URI };
     } else {
       if (!ANDROID_PACKAGE_NAME) {
         return res.status(400).json({
@@ -521,54 +519,32 @@ app.post("/api/create_link_token", async (req, res) => {
           hint: "Set ANDROID_PACKAGE_NAME (e.g. com.seanjones.flowlyapp)",
         });
       }
-      payload = { ...base, android_package_name: ANDROID_PACKAGE_NAME };
+      extras = { android_package_name: ANDROID_PACKAGE_NAME };
     }
+
+    const payload = { ...base, ...extras };
+    if (platform === "ios") delete payload.android_package_name;
+    else delete payload.redirect_uri;
 
     console.log("linkTokenCreate keys:", Object.keys(payload).sort());
 
-    const resp = await plaid.linkTokenCreate(payload);
-    return res.json({ link_token: resp.data.link_token, platform });
+    try {
+      const resp = await plaid.linkTokenCreate(payload);
+      return res.json({ link_token: resp.data.link_token, platform });
+    } catch (e) {
+      const code = e?.response?.data?.error_code;
+      // 🔁 NEW: automatic fallback to generic token (no redirect_uri/android_package_name)
+      if (code === "INVALID_CONFIGURATION") {
+        console.warn("Plaid INVALID_CONFIGURATION → retrying without flow-specific field");
+        const generic = { ...base };
+        delete generic.redirect_uri;
+        delete generic.android_package_name;
+        const r2 = await plaid.linkTokenCreate(generic);
+        return res.json({ link_token: r2.data.link_token, platform, fallback: true });
+      }
+      throw e;
+    }
   } catch (e) {
-    const code = e?.response?.data?.error_code;
-
-    if (code === "INVALID_FIELD") {
-      try {
-        const client_user_id = String(req.body?.userId || "demo-user");
-        const fallback = {
-          user: { client_user_id },
-          client_name: "Flowly",
-          products: PRODUCTS,
-          country_codes: ["US"],
-          language: "en",
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-        };
-        console.log("fallback linkTokenCreate keys:", Object.keys(fallback).sort());
-        const r2 = await plaid.linkTokenCreate(fallback);
-        return res.json({ link_token: r2.data.link_token, fallback: true });
-      } catch (e2) {
-        return sendPlaidError(res, e2);
-      }
-    }
-
-    if (code === "PRODUCTS_NOT_ENABLED") {
-      try {
-        const client_user_id = String(req.body?.userId || "demo-user");
-        const retry = {
-          user: { client_user_id },
-          client_name: "Flowly",
-          products: ["balance"],
-          country_codes: ["US"],
-          language: "en",
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-        };
-        console.log("retry linkTokenCreate keys:", Object.keys(retry).sort());
-        const r3 = await plaid.linkTokenCreate(retry);
-        return res.json({ link_token: r3.data.link_token, downgraded_to: "balance" });
-      } catch (e3) {
-        return sendPlaidError(res, e3);
-      }
-    }
-
     return sendPlaidError(res, e);
   }
 });
@@ -594,14 +570,40 @@ app.post("/api/create_update_mode_link_token", async (req, res) => {
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
-    // ✅ Build mutually exclusive payloads (no post-merge deletes)
-    const payload = platform === "ios"
-      ? ({ ...base, redirect_uri: PLAID_REDIRECT_URI })
-      : ({ ...base, android_package_name: ANDROID_PACKAGE_NAME });
+    let extras = {};
+    if (platform === "ios") {
+      if (!PLAID_REDIRECT_URI) {
+        return res.status(400).json({ error: "missing_redirect_uri" });
+      }
+      extras = { redirect_uri: PLAID_REDIRECT_URI };
+    } else {
+      if (!ANDROID_PACKAGE_NAME) {
+        return res.status(400).json({ error: "missing_android_package_name" });
+      }
+      extras = { android_package_name: ANDROID_PACKAGE_NAME };
+    }
+
+    const payload = { ...base, ...extras };
+    if (platform === "ios") delete payload.android_package_name;
+    else delete payload.redirect_uri;
 
     console.log("update-mode linkTokenCreate keys:", Object.keys(payload).sort());
-    const resp = await plaid.linkTokenCreate(payload);
-    return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
+
+    try {
+      const resp = await plaid.linkTokenCreate(payload);
+      return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
+    } catch (e) {
+      const code = e?.response?.data?.error_code;
+      if (code === "INVALID_CONFIGURATION") {
+        console.warn("Plaid INVALID_CONFIGURATION (update-mode) → retrying without flow-specific field");
+        const generic = { ...base };
+        delete generic.redirect_uri;
+        delete generic.android_package_name;
+        const r2 = await plaid.linkTokenCreate(generic);
+        return res.json({ link_token: r2.data.link_token, platform, mode: "update", fallback: true });
+      }
+      throw e;
+    }
   } catch (e) {
     return sendPlaidError(res, e);
   }
@@ -675,21 +677,10 @@ app.get("/api/accounts", async (req, res) => {
 app.post("/api/plaid/webhook", async (req, res) => {
   try {
     const { webhook_type, webhook_code, item_id } = req.body || {};
-
     if (webhook_type === "TRANSACTIONS" && webhook_code === "SYNC_UPDATES_AVAILABLE") {
       const userId = await getUserIdByItemId(item_id);
       console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
     }
-
-    // ✅ Clear recurring cache when Plaid says streams updated
-    if (webhook_type === "RECURRING_TRANSACTIONS" && webhook_code === "RECURRING_TRANSACTIONS_UPDATE") {
-      const userId = await getUserIdByItemId(item_id);
-      if (userId && STREAMS_CACHE.has(userId)) {
-        STREAMS_CACHE.delete(userId);
-        console.log("Cleared STREAMS_CACHE for user", userId, "due to recurring update");
-      }
-    }
-
     return res.json({ ok: true });
   } catch (e) {
     console.error("webhook error", e);
