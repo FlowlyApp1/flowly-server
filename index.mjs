@@ -472,7 +472,7 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
   const hit = STREAMS_CACHE.get(userId);
   if (hit && Date.now() - hit.ts < STREAMS_CACHE_TTL) return hit.streams;
 
-  // ✅ Correct Plaid SDK method name for /transactions/recurring/get
+  // ✅ Correct Plaid SDK method name
   const r = await plaid.transactionsRecurringGet({ access_token });
   const streams = r.data?.streams || [];
   STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
@@ -504,8 +504,8 @@ app.post("/api/create_link_token", async (req, res) => {
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
-    // Build extras strictly for ONE flow
-    let extras = {};
+    // ✅ Build mutually exclusive payloads (no post-merge deletes)
+    let payload;
     if (platform === "ios") {
       if (!PLAID_REDIRECT_URI) {
         return res.status(400).json({
@@ -513,7 +513,7 @@ app.post("/api/create_link_token", async (req, res) => {
           hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
         });
       }
-      extras = { redirect_uri: PLAID_REDIRECT_URI };
+      payload = { ...base, redirect_uri: PLAID_REDIRECT_URI };
     } else {
       if (!ANDROID_PACKAGE_NAME) {
         return res.status(400).json({
@@ -521,18 +521,9 @@ app.post("/api/create_link_token", async (req, res) => {
           hint: "Set ANDROID_PACKAGE_NAME (e.g. com.seanjones.flowlyapp)",
         });
       }
-      extras = { android_package_name: ANDROID_PACKAGE_NAME };
+      payload = { ...base, android_package_name: ANDROID_PACKAGE_NAME };
     }
 
-    // Final payload & hard sanitization (belt-and-suspenders)
-    const payload = { ...base, ...extras };
-    if (platform === "ios") {
-      delete payload.android_package_name;
-    } else {
-      delete payload.redirect_uri;
-    }
-
-    // Shallow debug: which keys are present (no secrets)
     console.log("linkTokenCreate keys:", Object.keys(payload).sort());
 
     const resp = await plaid.linkTokenCreate(payload);
@@ -551,10 +542,6 @@ app.post("/api/create_link_token", async (req, res) => {
           language: "en",
           ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
         };
-        // Ensure neither key sneaks in
-        delete fallback.redirect_uri;
-        delete fallback.android_package_name;
-
         console.log("fallback linkTokenCreate keys:", Object.keys(fallback).sort());
         const r2 = await plaid.linkTokenCreate(fallback);
         return res.json({ link_token: r2.data.link_token, fallback: true });
@@ -574,9 +561,6 @@ app.post("/api/create_link_token", async (req, res) => {
           language: "en",
           ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
         };
-        delete retry.redirect_uri;
-        delete retry.android_package_name;
-
         console.log("retry linkTokenCreate keys:", Object.keys(retry).sort());
         const r3 = await plaid.linkTokenCreate(retry);
         return res.json({ link_token: r3.data.link_token, downgraded_to: "balance" });
@@ -610,25 +594,10 @@ app.post("/api/create_update_mode_link_token", async (req, res) => {
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
-    let extras = {};
-    if (platform === "ios") {
-      if (!PLAID_REDIRECT_URI) {
-        return res.status(400).json({ error: "missing_redirect_uri" });
-      }
-      extras = { redirect_uri: PLAID_REDIRECT_URI };
-    } else {
-      if (!ANDROID_PACKAGE_NAME) {
-        return res.status(400).json({ error: "missing_android_package_name" });
-      }
-      extras = { android_package_name: ANDROID_PACKAGE_NAME };
-    }
-
-    const payload = { ...base, ...extras };
-    if (platform === "ios") {
-      delete payload.android_package_name;
-    } else {
-      delete payload.redirect_uri;
-    }
+    // ✅ Build mutually exclusive payloads (no post-merge deletes)
+    const payload = platform === "ios"
+      ? ({ ...base, redirect_uri: PLAID_REDIRECT_URI })
+      : ({ ...base, android_package_name: ANDROID_PACKAGE_NAME });
 
     console.log("update-mode linkTokenCreate keys:", Object.keys(payload).sort());
     const resp = await plaid.linkTokenCreate(payload);
@@ -712,7 +681,7 @@ app.post("/api/plaid/webhook", async (req, res) => {
       console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
     }
 
-    // ✅ Clear recurring cache when Plaid signals updates to recurring streams
+    // ✅ Clear recurring cache when Plaid says streams updated
     if (webhook_type === "RECURRING_TRANSACTIONS" && webhook_code === "RECURRING_TRANSACTIONS_UPDATE") {
       const userId = await getUserIdByItemId(item_id);
       if (userId && STREAMS_CACHE.has(userId)) {
