@@ -248,7 +248,7 @@ async function getAllTransactionsOnce({ userId, access_token }) {
 
   if (added.length === 0) {
     const end = new Date();
-    const start = new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000);
+    const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
     const resp = await plaid.transactionsGet({
       access_token,
       start_date: toISO(start),
