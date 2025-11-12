@@ -72,18 +72,26 @@ const addDays = (d, n) => {
  * Plaid setup
  * ==========================================================================*/
 const PLAID_ENV = (process.env.PLAID_ENV || "sandbox").trim(); // 'sandbox' | 'development' | 'production'
-const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions,recurring_transactions")
+
+// IMPORTANT: request core products via PLAID_PRODUCTS (e.g. "transactions")
+// and consent-requiring add-ons via PLAID_ADDITIONAL_PRODUCTS (e.g. "recurring_transactions")
+const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// IMPORTANT (iOS OAuth): must be your HTTPS page (Render), e.g. https://<domain>/plaid-oauth
+const ADDITIONAL_PRODUCTS = (process.env.PLAID_ADDITIONAL_PRODUCTS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// iOS OAuth redirect page hosted on this server
 const PLAID_REDIRECT_URI = (process.env.PLAID_REDIRECT_URI || "").trim();
 
-// Android intent verification (not used while iOS-only, but kept in /api/env-check)
+// Keep for diagnostics only (we are iOS-only for link token creation)
 const ANDROID_PACKAGE_NAME = (process.env.ANDROID_PACKAGE_NAME || "").trim();
 
-// Link customization (optional)
+// Optional Link customization
 const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim();
 console.log("Using Plaid Link customization =", LINK_CUSTOMIZATION || "(none)");
 
@@ -110,6 +118,7 @@ app.get("/api/env-check", (_req, res) =>
   res.json({
     env: PLAID_ENV,
     products: PRODUCTS,
+    additional_products: ADDITIONAL_PRODUCTS,
     hasClientId: !!process.env.PLAID_CLIENT_ID,
     hasSecret: !!process.env.PLAID_SECRET,
     redirectUri: PLAID_REDIRECT_URI || null,
@@ -124,11 +133,10 @@ app.get("/api/env-check", (_req, res) =>
 );
 
 /* ============================================================================
- * OAuth return page
- * Always bounce into the installed native app via the **flowlyapp://** scheme.
+ * OAuth return page → deeplink back to the native app (flowlyapp://)
  * ==========================================================================*/
 app.get("/plaid-oauth", (req, res) => {
-  const scheme = "flowlyapp"; // native app’s custom URL scheme
+  const scheme = "flowlyapp";
   const qs =
     Object.keys(req.query || {}).length
       ? `?${new URLSearchParams(req.query).toString()}`
@@ -198,11 +206,10 @@ app.post("/api/ai/chat", async (req, res) => {
  * ONE-PULL CORE (cache + single normalized fetch)
  * ==========================================================================*/
 
-// 60s in-memory cache: prevents bursty re-requests from multiple tabs/views
+// 60s in-memory cache
 const TXN_CACHE = new Map(); // key: userId -> { ts: number, txns: NormalizedTxn[] }
 const CACHE_TTL_MS = 60_000;
 
-/** Normalize a Plaid transaction into the shape your app expects. */
 function normalizeTxn(t) {
   const expense = t.amount > 0;
   const primary = t.personal_finance_category?.primary?.toLowerCase() || "uncategorized";
@@ -218,14 +225,10 @@ function normalizeTxn(t) {
   };
 }
 
-/** Single place that talks to Plaid for transactions, then caches the normalized list. */
 async function getAllTransactionsOnce({ userId, access_token }) {
   const hit = TXN_CACHE.get(userId);
-  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) {
-    return hit.txns;
-  }
+  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.txns;
 
-  // 1) incremental sync
   let cursor = await getCursor(userId);
   let added = [];
   let hasMore = true;
@@ -241,10 +244,8 @@ async function getAllTransactionsOnce({ userId, access_token }) {
     hasMore = !!sync.data.has_more;
   }
 
-  // persist next cursor
   await setUserCursor(userId, cursor);
 
-  // 2) backfill if needed
   if (added.length === 0) {
     const end = new Date();
     const start = new Date(end.getTime() - 90 * 24 * 60 * 60 * 1000);
@@ -257,15 +258,13 @@ async function getAllTransactionsOnce({ userId, access_token }) {
     added = resp.data.transactions || [];
   }
 
-  // 3) normalize
   const txns = added.map(normalizeTxn);
-
   TXN_CACHE.set(userId, { ts: Date.now(), txns });
   return txns;
 }
 
 /* ============================================================================
- * Recurring detection (heuristics on NORMALIZED txns — kept for other routes)
+ * Recurring detection (heuristics on NORMALIZED txns)
  * ==========================================================================*/
 
 const SUB_BRANDS = [
@@ -322,7 +321,6 @@ function merchantMatches(key, list) {
   return list.some((brand) => key.includes(brand));
 }
 
-// Derive from NORMALIZED txns (expenses are negative)
 function deriveSubscriptionsFromTxns(txns) {
   const expenses = txns.filter((t) => t.type === "expense").map((t) => ({ ...t, amount: Math.abs(t.amount) }));
   const byMerchant = groupByMerchantNormalized(expenses);
@@ -394,13 +392,11 @@ function deriveBillsFromTxns(txns) {
 }
 
 /* ============================================================================
- * Recurring streams (Plaid product) — cache + helpers
+ * Recurring streams (Plaid product)
  * ==========================================================================*/
-
 const STREAMS_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 const STREAMS_CACHE = new Map(); // key: userId -> { ts, streams }
 
-// Helper: map frequency → days + cycle label
 function freqToInfo(freq) {
   const f = String(freq || "").toUpperCase();
   if (f === "WEEKLY") return { days: 7, cycle: "monthly" };
@@ -418,7 +414,6 @@ function classifyStream(s) {
   const categories = (Array.isArray(s.category) ? s.category : []).map((c) => String(c).toLowerCase());
   const freq = String(s.frequency || "").toUpperCase();
 
-  // Name hints
   const subscriptionHints = [
     "netflix","hulu","disney","spotify","youtube","openai","adobe",
     "dropbox","onedrive","icloud","prime","audible","canva","notion",
@@ -435,7 +430,6 @@ function classifyStream(s) {
   const catHas = (kw) => categories.some((c) => c.includes(kw));
   const monthlyish = ["WEEKLY","BIWEEKLY","SEMI_MONTHLY","MONTHLY","QUARTERLY","ANNUALLY","YEARLY"].includes(freq);
 
-  // Strong signals from PFC if present
   const pfcLooksSubscription =
     pfcPrimary.includes("subscription") || pfcPrimary.includes("entertainment");
   const pfcLooksBill =
@@ -465,7 +459,6 @@ function classifyStream(s) {
   if (looksSubscription && !looksBill) return "subscription";
   if (nameHas(subscriptionHints)) return "subscription";
   if (nameHas(billHints)) return "bill";
-  // Default lean subscriptions (safer UX; bills should be specific)
   return "subscription";
 }
 
@@ -485,7 +478,7 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
  * Plaid routes
  * ==========================================================================*/
 
-// Create Link Token — iOS-only (hard-locked) to avoid multi-flow INVALID_CONFIGURATION.
+// Create Link Token — iOS-only; uses additional_consented_products for add-ons
 app.post("/api/create_link_token", async (req, res) => {
   try {
     const client_user_id = String(req.body?.userId || "demo-user");
@@ -497,20 +490,25 @@ app.post("/api/create_link_token", async (req, res) => {
       });
     }
 
-    // Build iOS-only payload (NO android_package_name)
     const payload = {
       user: { client_user_id },
       client_name: "Flowly",
       products: PRODUCTS,
+      additional_consented_products: ADDITIONAL_PRODUCTS,
       country_codes: ["US"],
       language: "en",
       redirect_uri: PLAID_REDIRECT_URI,
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
-    // Strip accidental empty-string/null top-level fields
+    // strip empty values
     for (const k of Object.keys(payload)) {
-      if (payload[k] === "" || payload[k] == null) delete payload[k];
+      const v = payload[k];
+      if (
+        v === "" ||
+        v == null ||
+        (Array.isArray(v) && v.length === 0)
+      ) delete payload[k];
     }
 
     console.log("linkTokenCreate (iOS-only) keys:", Object.keys(payload).sort());
@@ -521,7 +519,6 @@ app.post("/api/create_link_token", async (req, res) => {
     const code = e?.response?.data?.error_code;
 
     if (code === "INVALID_FIELD") {
-      // Retry without optional fields
       try {
         const client_user_id = String(req.body?.userId || "demo-user");
         const fallback = await plaid.linkTokenCreate({
@@ -539,7 +536,6 @@ app.post("/api/create_link_token", async (req, res) => {
     }
 
     if (code === "PRODUCTS_NOT_ENABLED") {
-      // Downgrade to 'transactions' only as a safe fallback
       try {
         const client_user_id = String(req.body?.userId || "demo-user");
         const retry = await plaid.linkTokenCreate({
@@ -577,7 +573,7 @@ app.post("/api/exchange_public_token", async (req, res) => {
   }
 });
 
-// Transactions (reuses cached single pull)
+// Transactions
 app.get("/api/transactions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
@@ -733,7 +729,7 @@ app.get("/api/bills", async (req, res) => {
     for (const s of streams) {
       if (classifyStream(s) !== "bill") continue;
 
-      const { days, cycle } = freqToInfo(s.frequency);
+      const { days } = freqToInfo(s.frequency);
       const next =
         s.next_date ||
         (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
