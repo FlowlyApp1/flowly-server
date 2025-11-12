@@ -1,3 +1,4 @@
+// index.mjs
 import bodyParser from "body-parser";
 import cors from "cors";
 import "dotenv/config";
@@ -79,11 +80,11 @@ const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions,recurring_transact
 // IMPORTANT (iOS OAuth): must be your HTTPS page (Render), e.g. https://<domain>/plaid-oauth
 const PLAID_REDIRECT_URI = (process.env.PLAID_REDIRECT_URI || "").trim();
 
-// Android intent verification
+// Android intent verification (not used while iOS-only, but kept in /api/env-check)
 const ANDROID_PACKAGE_NAME = (process.env.ANDROID_PACKAGE_NAME || "").trim();
 
 // Link customization (optional)
-const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim() || null;
+const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim();
 console.log("Using Plaid Link customization =", LINK_CUSTOMIZATION || "(none)");
 
 const plaidConfig = new Configuration({
@@ -197,7 +198,7 @@ app.post("/api/ai/chat", async (req, res) => {
  * ONE-PULL CORE (cache + single normalized fetch)
  * ==========================================================================*/
 
-// 60s in-memory cache
+// 60s in-memory cache: prevents bursty re-requests from multiple tabs/views
 const TXN_CACHE = new Map(); // key: userId -> { ts: number, txns: NormalizedTxn[] }
 const CACHE_TTL_MS = 60_000;
 
@@ -417,6 +418,7 @@ function classifyStream(s) {
   const categories = (Array.isArray(s.category) ? s.category : []).map((c) => String(c).toLowerCase());
   const freq = String(s.frequency || "").toUpperCase();
 
+  // Name hints
   const subscriptionHints = [
     "netflix","hulu","disney","spotify","youtube","openai","adobe",
     "dropbox","onedrive","icloud","prime","audible","canva","notion",
@@ -433,6 +435,7 @@ function classifyStream(s) {
   const catHas = (kw) => categories.some((c) => c.includes(kw));
   const monthlyish = ["WEEKLY","BIWEEKLY","SEMI_MONTHLY","MONTHLY","QUARTERLY","ANNUALLY","YEARLY"].includes(freq);
 
+  // Strong signals from PFC if present
   const pfcLooksSubscription =
     pfcPrimary.includes("subscription") || pfcPrimary.includes("entertainment");
   const pfcLooksBill =
@@ -462,6 +465,7 @@ function classifyStream(s) {
   if (looksSubscription && !looksBill) return "subscription";
   if (nameHas(subscriptionHints)) return "subscription";
   if (nameHas(billHints)) return "bill";
+  // Default lean subscriptions (safer UX; bills should be specific)
   return "subscription";
 }
 
@@ -478,133 +482,80 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
 }
 
 /* ============================================================================
- * Plaid routes (reuse ONE-PULL core; subs/bills now use streams)
+ * Plaid routes
  * ==========================================================================*/
 
-// Create Link Token — client must pass { platform: 'ios' | 'android' }
+// Create Link Token — iOS-only (hard-locked) to avoid multi-flow INVALID_CONFIGURATION.
 app.post("/api/create_link_token", async (req, res) => {
   try {
     const client_user_id = String(req.body?.userId || "demo-user");
-    const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
-    if (platform !== "ios" && platform !== "android") {
+
+    if (!PLAID_REDIRECT_URI) {
       return res.status(400).json({
-        error: "invalid_platform",
-        hint: "Pass platform as 'ios' or 'android'.",
+        error: "missing_redirect_uri",
+        hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
       });
     }
 
-    const base = {
+    // Build iOS-only payload (NO android_package_name)
+    const payload = {
       user: { client_user_id },
       client_name: "Flowly",
       products: PRODUCTS,
       country_codes: ["US"],
       language: "en",
+      redirect_uri: PLAID_REDIRECT_URI,
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
-    // Build extras strictly for ONE flow
-    let extras = {};
-    if (platform === "ios") {
-      if (!PLAID_REDIRECT_URI) {
-        return res.status(400).json({
-          error: "missing_redirect_uri",
-          hint: "Set PLAID_REDIRECT_URI to your HTTPS page, e.g. https://<your-domain>/plaid-oauth",
-        });
-      }
-      extras = { redirect_uri: PLAID_REDIRECT_URI };
-    } else {
-      if (!ANDROID_PACKAGE_NAME) {
-        return res.status(400).json({
-          error: "missing_android_package_name",
-          hint: "Set ANDROID_PACKAGE_NAME (e.g. com.seanjones.flowlyapp)",
-        });
-      }
-      extras = { android_package_name: ANDROID_PACKAGE_NAME };
+    // Strip accidental empty-string/null top-level fields
+    for (const k of Object.keys(payload)) {
+      if (payload[k] === "" || payload[k] == null) delete payload[k];
     }
 
-    const payload = { ...base, ...extras };
-    if (platform === "ios") delete payload.android_package_name;
-    else delete payload.redirect_uri;
+    console.log("linkTokenCreate (iOS-only) keys:", Object.keys(payload).sort());
 
-    console.log("linkTokenCreate keys:", Object.keys(payload).sort());
-
-    try {
-      const resp = await plaid.linkTokenCreate(payload);
-      return res.json({ link_token: resp.data.link_token, platform });
-    } catch (e) {
-      const code = e?.response?.data?.error_code;
-      // 🔁 NEW: automatic fallback to generic token (no redirect_uri/android_package_name)
-      if (code === "INVALID_CONFIGURATION") {
-        console.warn("Plaid INVALID_CONFIGURATION → retrying without flow-specific field");
-        const generic = { ...base };
-        delete generic.redirect_uri;
-        delete generic.android_package_name;
-        const r2 = await plaid.linkTokenCreate(generic);
-        return res.json({ link_token: r2.data.link_token, platform, fallback: true });
-      }
-      throw e;
-    }
+    const resp = await plaid.linkTokenCreate(payload);
+    return res.json({ link_token: resp.data.link_token, platform: "ios" });
   } catch (e) {
-    return sendPlaidError(res, e);
-  }
-});
+    const code = e?.response?.data?.error_code;
 
-// 🔁 Update-Mode Link Token — let users reconsent / add permissions
-app.post("/api/create_update_mode_link_token", async (req, res) => {
-  try {
-    const userId = String(req.body?.userId || "demo-user");
-    const platform = String(req.body?.platform || "").toLowerCase(); // 'ios' | 'android'
-
-    const dbUser = await getUserById(userId);
-    if (!dbUser?.access_token) return res.status(400).json({ error: "no_linked_item" });
-
-    if (platform !== "ios" && platform !== "android") {
-      return res.status(400).json({ error: "invalid_platform", hint: "Use 'ios' or 'android'." });
+    if (code === "INVALID_FIELD") {
+      // Retry without optional fields
+      try {
+        const client_user_id = String(req.body?.userId || "demo-user");
+        const fallback = await plaid.linkTokenCreate({
+          user: { client_user_id },
+          client_name: "Flowly",
+          products: PRODUCTS,
+          country_codes: ["US"],
+          language: "en",
+          redirect_uri: PLAID_REDIRECT_URI,
+        });
+        return res.json({ link_token: fallback.data.link_token, fallback: true, platform: "ios" });
+      } catch (e2) {
+        return sendPlaidError(res, e2);
+      }
     }
 
-    const base = {
-      access_token: dbUser.access_token, // update-mode: no products override
-      client_name: "Flowly",
-      country_codes: ["US"],
-      language: "en",
-      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-    };
-
-    let extras = {};
-    if (platform === "ios") {
-      if (!PLAID_REDIRECT_URI) {
-        return res.status(400).json({ error: "missing_redirect_uri" });
+    if (code === "PRODUCTS_NOT_ENABLED") {
+      // Downgrade to 'transactions' only as a safe fallback
+      try {
+        const client_user_id = String(req.body?.userId || "demo-user");
+        const retry = await plaid.linkTokenCreate({
+          user: { client_user_id },
+          client_name: "Flowly",
+          products: ["transactions"],
+          country_codes: ["US"],
+          language: "en",
+          redirect_uri: PLAID_REDIRECT_URI,
+        });
+        return res.json({ link_token: retry.data.link_token, downgraded_to: "transactions", platform: "ios" });
+      } catch (e3) {
+        return sendPlaidError(res, e3);
       }
-      extras = { redirect_uri: PLAID_REDIRECT_URI };
-    } else {
-      if (!ANDROID_PACKAGE_NAME) {
-        return res.status(400).json({ error: "missing_android_package_name" });
-      }
-      extras = { android_package_name: ANDROID_PACKAGE_NAME };
     }
 
-    const payload = { ...base, ...extras };
-    if (platform === "ios") delete payload.android_package_name;
-    else delete payload.redirect_uri;
-
-    console.log("update-mode linkTokenCreate keys:", Object.keys(payload).sort());
-
-    try {
-      const resp = await plaid.linkTokenCreate(payload);
-      return res.json({ link_token: resp.data.link_token, platform, mode: "update" });
-    } catch (e) {
-      const code = e?.response?.data?.error_code;
-      if (code === "INVALID_CONFIGURATION") {
-        console.warn("Plaid INVALID_CONFIGURATION (update-mode) → retrying without flow-specific field");
-        const generic = { ...base };
-        delete generic.redirect_uri;
-        delete generic.android_package_name;
-        const r2 = await plaid.linkTokenCreate(generic);
-        return res.json({ link_token: r2.data.link_token, platform, mode: "update", fallback: true });
-      }
-      throw e;
-    }
-  } catch (e) {
     return sendPlaidError(res, e);
   }
 });
@@ -620,13 +571,13 @@ app.post("/api/exchange_public_token", async (req, res) => {
     const { access_token, item_id } = r.data;
 
     await upsertUserItem({ userId, access_token, item_id });
-    return res.json({ ok: true, item_id });
+    res.json({ ok: true, item_id });
   } catch (e) {
     return sendPlaidError(res, e);
   }
 });
 
-// Transactions
+// Transactions (reuses cached single pull)
 app.get("/api/transactions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
@@ -634,7 +585,7 @@ app.get("/api/transactions", async (req, res) => {
     if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
 
     const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
-    return res.json({ txns });
+    res.json({ txns });
   } catch (e) {
     return sendPlaidError(res, e);
   }
@@ -663,7 +614,7 @@ app.get("/api/accounts", async (req, res) => {
       institution: a.official_name || undefined,
     }));
 
-    return res.json({ accounts });
+    res.json({ accounts });
   } catch (e) {
     const code = e?.response?.data?.error_code || e?.error_code;
     if (code === "PRODUCT_NOT_READY") {
@@ -681,10 +632,10 @@ app.post("/api/plaid/webhook", async (req, res) => {
       const userId = await getUserIdByItemId(item_id);
       console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
     }
-    return res.json({ ok: true });
+    res.json({ ok: true });
   } catch (e) {
     console.error("webhook error", e);
-    return res.status(200).json({ ok: true });
+    res.status(200).json({ ok: true });
   }
 });
 
@@ -701,7 +652,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
       deriveBillsFromTxns(txns),
     ]);
 
-    return res.json({
+    res.json({
       txns,
       subscriptions: subs.map((s) => ({
         id: s.id,
@@ -762,7 +713,7 @@ app.get("/api/subscriptions", async (req, res) => {
       });
     }
 
-    return res.json({ subscriptions: subs });
+    res.json({ subscriptions: subs });
   } catch (e) {
     const code = e?.response?.data?.error_code || e?.error_code;
     if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
@@ -801,7 +752,7 @@ app.get("/api/bills", async (req, res) => {
       });
     }
 
-    return res.json({ bills });
+    res.json({ bills });
   } catch (e) {
     const code = e?.response?.data?.error_code || e?.error_code;
     if (code === "PRODUCT_NOT_READY") return res.status(202).json({ error: "PRODUCT_NOT_READY" });
