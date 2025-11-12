@@ -468,7 +468,7 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
   const hit = STREAMS_CACHE.get(userId);
   if (hit && Date.now() - hit.ts < STREAMS_CACHE_TTL) return hit.streams;
 
-  const r = await plaid.recurringTransactionsGet({ access_token });
+  const r = await plaid.transactionsRecurringGet({ access_token });
   const streams = r.data?.streams || [];
   STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
   return streams;
