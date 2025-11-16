@@ -627,6 +627,10 @@ app.post("/api/plaid/webhook", async (req, res) => {
       const userId = await getUserIdByItemId(item_id);
       console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
     }
+    if (webhook_type === "TRANSACTIONS" && webhook_code === "RECURRING_TRANSACTIONS_UPDATE") {
+      const userId = await getUserIdByItemId(item_id);
+      if (userId) STREAMS_CACHE.delete(userId);
+    }
     res.json({ ok: true });
   } catch (e) {
     console.error("webhook error", e);
