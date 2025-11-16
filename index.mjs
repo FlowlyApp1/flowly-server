@@ -73,13 +73,13 @@ const addDays = (d, n) => {
  * ==========================================================================*/
 const PLAID_ENV = (process.env.PLAID_ENV || "sandbox").trim(); // 'sandbox' | 'development' | 'production'
 
-// IMPORTANT: request core products via PLAID_PRODUCTS (e.g. "transactions")
-// and consent-requiring add-ons via PLAID_ADDITIONAL_PRODUCTS (e.g. "recurring_transactions")
+// Core products via PLAID_PRODUCTS (e.g. "transactions")
 const PRODUCTS = (process.env.PLAID_PRODUCTS || "transactions")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// (We no longer send additional_consented_products to avoid INVALID_FIELD)
 const ADDITIONAL_PRODUCTS = (process.env.PLAID_ADDITIONAL_PRODUCTS || "")
   .split(",")
   .map((s) => s.trim())
@@ -87,9 +87,6 @@ const ADDITIONAL_PRODUCTS = (process.env.PLAID_ADDITIONAL_PRODUCTS || "")
 
 // iOS OAuth redirect page hosted on this server
 const PLAID_REDIRECT_URI = (process.env.PLAID_REDIRECT_URI || "").trim();
-
-// Keep for diagnostics only (we are iOS-only for link token creation)
-const ANDROID_PACKAGE_NAME = (process.env.ANDROID_PACKAGE_NAME || "").trim();
 
 // Optional Link customization
 const LINK_CUSTOMIZATION = (process.env.PLAID_LINK_CUSTOMIZATION || "").trim();
@@ -117,16 +114,13 @@ app.get("/api/env-check", (_req, res) =>
   res.json({
     env: PLAID_ENV,
     products: PRODUCTS,
-    additional_products: ADDITIONAL_PRODUCTS,
+    additional_products: ADDITIONAL_PRODUCTS, // informational only
     hasClientId: !!process.env.PLAID_CLIENT_ID,
     hasSecret: !!process.env.PLAID_SECRET,
     redirectUri: PLAID_REDIRECT_URI || null,
-    androidPackageName: ANDROID_PACKAGE_NAME || null,
+    androidPackageName: null,
     linkCustomization: LINK_CUSTOMIZATION || null,
-    using:
-      ANDROID_PACKAGE_NAME
-        ? `android_package_name=${ANDROID_PACKAGE_NAME}`
-        : (PLAID_REDIRECT_URI ? `redirect_uri=${PLAID_REDIRECT_URI}` : "(none)"),
+    using: PLAID_REDIRECT_URI ? `redirect_uri=${PLAID_REDIRECT_URI}` : "(none)",
     hasOpenAI: !!(process.env.OPENAI_API_KEY || process.env.EXPO_PUBLIC_OPENAI_API_KEY),
   })
 );
@@ -202,7 +196,7 @@ app.post("/api/ai/chat", async (req, res) => {
 });
 
 /* ============================================================================
- * ONE-PULL CORE (cache + single normalized fetch)
+ * 12-month transactions (cached)
  * ==========================================================================*/
 
 // 60s in-memory cache
@@ -225,49 +219,69 @@ function normalizeTxn(t) {
   };
 }
 
-async function getAllTransactionsOnce({ userId, access_token }) {
-  const hit = TXN_CACHE.get(userId);
-  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.txns;
+// Pull full 12 months with pagination every time cache expires
+async function fetchTransactions12m(access_token) {
+  const end = new Date();
+  const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
 
-  let cursor = await getCursor(userId);
-  let added = [];
-  let hasMore = true;
+  const all = [];
+  let offset = 0;
+  const count = 500;
 
-  while (hasMore) {
-    const sync = await plaid.transactionsSync({
-      access_token,
-      cursor: cursor || undefined,
-      count: 500,
-    });
-    added = added.concat(sync.data.added || []);
-    cursor = sync.data.next_cursor;
-    hasMore = !!sync.data.has_more;
-  }
-
-  await setUserCursor(userId, cursor);
-
-  if (added.length === 0) {
-    const end = new Date();
-    const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
+  while (true) {
     const resp = await plaid.transactionsGet({
       access_token,
       start_date: toISO(start),
       end_date: toISO(end),
-      options: { count: 500, include_personal_finance_category: true },
+      options: {
+        include_personal_finance_category: true,
+        count,
+        offset,
+      },
     });
-    added = resp.data.transactions || [];
+
+    const tx = resp.data.transactions || [];
+    all.push(...tx);
+
+    const total = resp.data.total_transactions ?? all.length;
+    if (all.length >= total || tx.length === 0) break;
+
+    offset += tx.length;
+    if (offset > 10000) break; // ultra-safety guard
   }
 
-  const txns = added.map(normalizeTxn);
+  return all.map(normalizeTxn);
+}
+
+async function getAllTransactionsOnce({ userId, access_token }) {
+  const hit = TXN_CACHE.get(userId);
+  if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.txns;
+
+  // Try to advance cursor quietly (not required for 12mo backfill)
+  try {
+    let cursor = await getCursor(userId);
+    let hasMore = true;
+    while (hasMore) {
+      const sync = await plaid.transactionsSync({
+        access_token,
+        cursor: cursor || undefined,
+        count: 500,
+      });
+      cursor = sync.data.next_cursor;
+      hasMore = !!sync.data.has_more;
+    }
+    await setUserCursor(userId, cursor);
+  } catch (e) {
+    console.log("transactionsSync warm-up failed (non-fatal):", toText(e?.response?.data || e?.message || e));
+  }
+
+  const txns = await fetchTransactions12m(access_token);
   TXN_CACHE.set(userId, { ts: Date.now(), txns });
   return txns;
 }
 
 /* ============================================================================
- * Recurring detection (heuristics fallback)
- *  - Prefer Plaid streams; this is fallback.
- *  - Rules: whitelist OR monthly cadence + history + stable amounts.
- *  - Exclude obvious one-offs unless whitelisted.
+ * Recurring detection (fallback heuristics)
  * ==========================================================================*/
 
 // Whitelists (known good)
@@ -285,7 +299,7 @@ const BILL_BRANDS = [
   "mortgage","rent","loan","navient","nelnet"
 ];
 
-// Obvious one-off retail/food/gas/grocery to exclude unless whitelisted
+// Obvious one-offs to exclude unless whitelisted
 const EXCLUDE_HINTS = [
   "mcdonald","burger king","wendy's","taco bell","chipotle","starbucks","dunkin","subway",
   "chick-fil-a","panda express","little caesars","domino","pizza hut","kfc","arby's","sonic",
@@ -308,17 +322,12 @@ function monthlyGaps(dates) {
   }
   return count;
 }
-
-function looksMonthly(dates) {
-  return monthlyGaps(dates) >= 1;
-}
-
+function looksMonthly(dates) { return monthlyGaps(dates) >= 1; }
 function dateSpanDays(dates) {
   if (!dates.length) return 0;
   const sorted = [...dates].sort((a, b) => new Date(a) - new Date(b));
   return daysBetween(sorted[0], sorted[sorted.length - 1]);
 }
-
 function nextMonthlyFrom(lastISO) { return addDays(lastISO, 30); }
 
 function pickWebsiteFromNormalized(t) {
@@ -326,7 +335,6 @@ function pickWebsiteFromNormalized(t) {
   const cp = Array.isArray(t.counterparties) ? t.counterparties[0] : null;
   return cp?.website || null;
 }
-
 function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
   return {
     id,
@@ -339,7 +347,6 @@ function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
     alerts: false,
   };
 }
-
 function groupByMerchantNormalized(txns) {
   const map = new Map();
   for (const t of txns) {
@@ -350,11 +357,7 @@ function groupByMerchantNormalized(txns) {
   }
   return map;
 }
-
-function merchantMatches(key, list) {
-  return list.some((brand) => key.includes(brand));
-}
-
+function merchantMatches(key, list) { return list.some((brand) => key.includes(brand)); }
 function topCategoryPrimary(rows) {
   const counts = new Map();
   for (const r of rows) {
@@ -362,14 +365,10 @@ function topCategoryPrimary(rows) {
     if (!c) continue;
     counts.set(c, (counts.get(c) || 0) + 1);
   }
-  let top = null;
-  let max = 0;
-  for (const [k, v] of counts) {
-    if (v > max) { max = v; top = k; }
-  }
+  let top = null, max = 0;
+  for (const [k, v] of counts) { if (v > max) { max = v; top = k; } }
   return top;
 }
-
 function coefVar(nums) {
   if (!nums.length) return Infinity;
   const mean = nums.reduce((a, b) => a + b, 0) / nums.length;
@@ -400,24 +399,14 @@ function deriveSubscriptionsFromTxns(txns) {
     const isKnownBill = merchantMatches(key, BILL_BRANDS);
     const excludedByName = merchantMatches(key, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
-
     if ((excludedByName || excludedByPFC) && !isKnownSub) continue;
 
     const occ = group.rows.length;
     const cv = coefVar(amounts);
 
-    const passesKnown =
-      isKnownSub && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
-
-    const passesUnknown =
-      !isKnownSub &&
-      !isKnownBill &&
-      occ >= 3 &&
-      span >= 60 &&
-      gapsMonthly >= 1;
-
-    const stable =
-      (isKnownSub ? cv <= 0.40 : cv <= 0.30);
+    const passesKnown = isKnownSub && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
+    const passesUnknown = !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
+    const stable = (isKnownSub ? cv <= 0.40 : cv <= 0.30);
 
     if ((passesKnown || passesUnknown) && stable) {
       const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
@@ -461,23 +450,13 @@ function deriveBillsFromTxns(txns) {
     const isKnownSub = merchantMatches(key, SUB_BRANDS);
     const excludedByName = merchantMatches(key, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
-
     if ((excludedByName || excludedByPFC) && !isKnownBill) continue;
 
     const occ = group.rows.length;
     const cv = coefVar(amounts);
 
-    const passesKnown =
-      isKnownBill && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
-
-    const passesUnknown =
-      !isKnownBill &&
-      !isKnownSub &&
-      occ >= 3 &&
-      span >= 60 &&
-      gapsMonthly >= 1;
-
-    // Bills can be more variable; allow higher CV
+    const passesKnown = isKnownBill && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
+    const passesUnknown = !isKnownBill && !isKnownSub && occ >= 3 && span >= 60 && gapsMonthly >= 1;
     const stable = cv <= 0.60;
 
     if ((passesKnown || passesUnknown) && stable) {
@@ -551,19 +530,11 @@ function classifyStream(s) {
     pfcPrimary.includes("utilities");
 
   const looksBill =
-    pfcLooksBill ||
-    nameHas(billHints) ||
-    catHas("utilities") ||
-    catHas("telecommunication") ||
-    catHas("insurance") ||
-    catHas("service") ||
-    catHas("mortgage") ||
-    catHas("rent") ||
-    catHas("loan");
+    pfcLooksBill || nameHas(billHints) || catHas("utilities") || catHas("telecommunication") ||
+    catHas("insurance") || catHas("service") || catHas("mortgage") || catHas("rent") || catHas("loan");
 
   const looksSubscription =
-    pfcLooksSubscription ||
-    (monthlyish && (nameHas(subscriptionHints) || catHas("subscription") || catHas("entertainment")));
+    pfcLooksSubscription || (monthlyish && (nameHas(subscriptionHints) || catHas("subscription") || catHas("entertainment")));
 
   if (looksBill && !looksSubscription) return "bill";
   if (looksSubscription && !looksBill) return "subscription";
@@ -588,7 +559,7 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
  * Plaid routes
  * ==========================================================================*/
 
-// Create Link Token — iOS-only; uses additional_consented_products for add-ons
+// Create Link Token — iOS-only; **no additional_consented_products** to avoid INVALID_FIELD
 app.post("/api/create_link_token", async (req, res) => {
   try {
     const client_user_id = String(req.body?.userId || "demo-user");
@@ -604,68 +575,16 @@ app.post("/api/create_link_token", async (req, res) => {
       user: { client_user_id },
       client_name: "Flowly",
       products: PRODUCTS,
-      additional_consented_products: ["recurring_transactions"],
       country_codes: ["US"],
       language: "en",
       redirect_uri: PLAID_REDIRECT_URI,
       ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
     };
 
-    // strip empty values
-    for (const k of Object.keys(payload)) {
-      const v = payload[k];
-      if (
-        v === "" ||
-        v == null ||
-        (Array.isArray(v) && v.length === 0)
-      ) delete payload[k];
-    }
-
     console.log("linkTokenCreate (iOS-only) keys:", Object.keys(payload).sort());
-
     const resp = await plaid.linkTokenCreate(payload);
     return res.json({ link_token: resp.data.link_token, platform: "ios" });
   } catch (e) {
-    const code = e?.response?.data?.error_code;
-
-    if (code === "INVALID_FIELD") {
-      try {
-        const client_user_id = String(req.body?.userId || "demo-user");
-        const fallback = await plaid.linkTokenCreate({
-          user: { client_user_id },
-          client_name: "Flowly",
-          products: PRODUCTS,
-          additional_consented_products: ["recurring_transactions"],
-          country_codes: ["US"],
-          language: "en",
-          redirect_uri: PLAID_REDIRECT_URI,
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-        });
-        return res.json({ link_token: fallback.data.link_token, fallback: true, platform: "ios" });
-      } catch (e2) {
-        return sendPlaidError(res, e2);
-      }
-    }
-
-    if (code === "PRODUCTS_NOT_ENABLED") {
-      try {
-        const client_user_id = String(req.body?.userId || "demo-user");
-        const retry = await plaid.linkTokenCreate({
-          user: { client_user_id },
-          client_name: "Flowly",
-          products: ["transactions"],
-          additional_consented_products: ["recurring_transactions"],
-          country_codes: ["US"],
-          language: "en",
-          redirect_uri: PLAID_REDIRECT_URI,
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
-        });
-        return res.json({ link_token: retry.data.link_token, downgraded_to: "transactions", platform: "ios" });
-      } catch (e3) {
-        return sendPlaidError(res, e3);
-      }
-    }
-
     return sendPlaidError(res, e);
   }
 });
@@ -687,7 +606,7 @@ app.post("/api/exchange_public_token", async (req, res) => {
   }
 });
 
-// Transactions
+// Transactions (returns full 12 months, cached 60s)
 app.get("/api/transactions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
@@ -919,9 +838,7 @@ app.get("/api/debug/recurring", async (req, res) => {
         subscriptions: subsFallback,
         bills: billsFallback,
       },
-      meta: {
-        txns: txns.length,
-      },
+      meta: { txns: txns.length },
     });
   } catch (e) {
     return sendPlaidError(res, e);
