@@ -101,7 +101,7 @@ const plaidConfig = new Configuration({
     headers: {
       "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID || "",
       "PLAID-SECRET": process.env.PLAID_SECRET || "",
-      "Plaid-Version": "2020-09-14",
+      "Plaid-Version": "2024-10-01",
     },
     timeout: 20000,
   },
@@ -494,7 +494,7 @@ app.post("/api/create_link_token", async (req, res) => {
       user: { client_user_id },
       client_name: "Flowly",
       products: PRODUCTS,
-      additional_consented_products: ADDITIONAL_PRODUCTS,
+      additional_consented_products: ["recurring_transactions"],
       country_codes: ["US"],
       language: "en",
       redirect_uri: PLAID_REDIRECT_URI,
