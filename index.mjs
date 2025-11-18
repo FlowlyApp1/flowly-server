@@ -1,4 +1,3 @@
-// index.mjs
 import bodyParser from "body-parser";
 import cors from "cors";
 import "dotenv/config";
@@ -239,42 +238,58 @@ function normalizeTxn(t) {
 }
 
 async function getAllTransactionsOnce({ userId, access_token }) {
+  // In-memory cache for 60s to avoid hammering Plaid when user re-opens Budget quickly
   const hit = TXN_CACHE.get(userId);
   if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.txns;
 
+  // 1) Run /transactions/sync to keep cursor + webhooks working
   let cursor = await getCursor(userId);
-  let added = [];
-  let hasMore = true;
+  let hasMoreSync = true;
 
-  while (hasMore) {
+  while (hasMoreSync) {
     const sync = await plaid.transactionsSync({
       access_token,
       cursor: cursor || undefined,
       count: 500,
     });
-    added = added.concat(sync.data.added || []);
-    cursor = sync.data.next_cursor;
-    hasMore = !!sync.data.has_more;
+    const nextCursor = sync.data.next_cursor;
+    cursor = nextCursor;
+    hasMoreSync = !!sync.data.has_more;
   }
 
   await setUserCursor(userId, cursor);
 
-  // If first-time/empty via sync, backfill last 12 months with transactionsGet
-  if (added.length === 0) {
-    const end = new Date();
-    const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000);
+  // 2) Always fetch up to last 12 months of history via /transactions/get (with pagination)
+  const end = new Date();
+  const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000); // ~12 months
+
+  let all = [];
+  let offset = 0;
+  let hasMorePages = true;
+
+  while (hasMorePages) {
     const resp = await plaid.transactionsGet({
       access_token,
       start_date: toISO(start),
       end_date: toISO(end),
-      options: { count: 500, include_personal_finance_category: true },
+      options: {
+        count: 500,
+        offset,
+        include_personal_finance_category: true,
+      },
     });
-    added = resp.data.transactions || [];
+
+    const txns = resp.data.transactions || [];
+    const total = resp.data.total_transactions || 0;
+
+    all = all.concat(txns);
+    offset = all.length;
+    hasMorePages = all.length < total;
   }
 
-  const txns = added.map(normalizeTxn);
-  TXN_CACHE.set(userId, { ts: Date.now(), txns });
-  return txns;
+  const normalized = all.map(normalizeTxn);
+  TXN_CACHE.set(userId, { ts: Date.now(), txns: normalized });
+  return normalized;
 }
 
 /* ============================================================================
@@ -780,6 +795,10 @@ app.post("/api/create_link_token", async (req, res) => {
       country_codes: ["US"],
       language: "en",
       redirect_uri: PLAID_REDIRECT_URI,
+      // ✅ Request up to 365 days of transaction history for new Items
+      transactions: {
+        days_requested: 365,
+      },
       ...(LINK_CUSTOMIZATION
         ? { link_customization_name: LINK_CUSTOMIZATION }
         : {}),
@@ -811,6 +830,9 @@ app.post("/api/create_link_token", async (req, res) => {
           country_codes: ["US"],
           language: "en",
           redirect_uri: PLAID_REDIRECT_URI,
+          transactions: {
+            days_requested: 365,
+          },
           ...(LINK_CUSTOMIZATION
             ? { link_customization_name: LINK_CUSTOMIZATION }
             : {}),
@@ -835,6 +857,9 @@ app.post("/api/create_link_token", async (req, res) => {
           country_codes: ["US"],
           language: "en",
           redirect_uri: PLAID_REDIRECT_URI,
+          transactions: {
+            days_requested: 365,
+          },
           ...(LINK_CUSTOMIZATION
             ? { link_customization_name: LINK_CUSTOMIZATION }
             : {}),
