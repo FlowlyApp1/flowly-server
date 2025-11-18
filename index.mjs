@@ -428,6 +428,9 @@ const EXCLUDE_PFC = [
   "shopping",
 ];
 
+// Consider a subscription/bill "stale" if last charge older than this
+const RECENT_DAYS_CUTOFF = 90;
+
 function monthlyGaps(dates) {
   let count = 0;
   if (dates.length < 2) return 0;
@@ -523,6 +526,7 @@ function deriveSubscriptionsFromTxns(txns) {
 
   const byMerchant = groupByMerchantNormalized(expenses);
   const out = [];
+  const now = new Date();
 
   for (const [key, group] of byMerchant.entries()) {
     const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
@@ -532,24 +536,36 @@ function deriveSubscriptionsFromTxns(txns) {
     const gapsMonthly = monthlyGaps(dates);
     const name = group.name;
 
+    // Last charge recency filter (drop old stuff)
+    const lastDate =
+      dates.length > 0
+        ? dates.reduce(
+            (latest, d) =>
+              new Date(d) > new Date(latest) ? d : latest,
+            dates[0]
+          )
+        : null;
+    if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
+
     const topPFC = topCategoryPrimary(group.rows) || "";
     const isKnownSub = merchantMatches(key, SUB_BRANDS);
     const isKnownBill = merchantMatches(key, BILL_BRANDS);
     const excludedByName = merchantMatches(key, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
 
+    // Exclude food/gas/shopping unless explicitly whitelisted
     if ((excludedByName || excludedByPFC) && !isKnownSub) continue;
 
     const occ = group.rows.length;
     const cv = coefVar(amounts);
 
-    const passesKnown =
-      isKnownSub && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
+    // Known subs: be more lenient, just require at least 1 recent charge
+    const passesKnown = isKnownSub && occ >= 1;
 
     const passesUnknown =
       !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
 
-    const stable = isKnownSub ? cv <= 0.4 : cv <= 0.3;
+    const stable = isKnownSub ? cv <= 0.6 : cv <= 0.3;
 
     if ((passesKnown || passesUnknown) && stable) {
       const latest = group.rows.sort(
@@ -581,6 +597,7 @@ function deriveBillsFromTxns(txns) {
 
   const byMerchant = groupByMerchantNormalized(expenses);
   const out = [];
+  const now = new Date();
 
   for (const [key, group] of byMerchant.entries()) {
     const name = group.name;
@@ -589,6 +606,17 @@ function deriveBillsFromTxns(txns) {
     const gapsMonthly = monthlyGaps(dates);
     const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
+
+    // Last charge recency filter (drop old bills)
+    const lastDate =
+      dates.length > 0
+        ? dates.reduce(
+            (latest, d) =>
+              new Date(d) > new Date(latest) ? d : latest,
+            dates[0]
+          )
+        : null;
+    if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
 
     const topPFC = topCategoryPrimary(group.rows) || "";
     const isKnownBill = merchantMatches(key, BILL_BRANDS);
@@ -601,7 +629,7 @@ function deriveBillsFromTxns(txns) {
     const cv = coefVar(amounts);
 
     const passesKnown =
-      isKnownBill && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
+      isKnownBill && occ >= 1 && (gapsMonthly >= 1 || span >= 45);
     const passesUnknown =
       !isKnownBill &&
       !isKnownSub &&
@@ -610,7 +638,7 @@ function deriveBillsFromTxns(txns) {
       gapsMonthly >= 1;
 
     // Bills can be more variable; allow higher CV
-    const stable = cv <= 0.6;
+    const stable = cv <= 0.7;
 
     if ((passesKnown || passesUnknown) && stable) {
       const latest = group.rows.sort(
@@ -753,11 +781,41 @@ function classifyStream(s) {
         catHas("subscription") ||
         catHas("entertainment")));
 
+  // Filter obvious food/gas/shopping merchants unless whitelisted
+  const isFoodGasShopping =
+    pfcPrimary.includes("restaurant") ||
+    pfcPrimary.includes("fast food") ||
+    pfcPrimary.includes("food and drink") ||
+    pfcPrimary.includes("grocery") ||
+    pfcPrimary.includes("gas") ||
+    pfcPrimary.includes("fuel") ||
+    pfcPrimary.includes("shopping") ||
+    pfcPrimary.includes("general merchandise") ||
+    categories.some(
+      (c) =>
+        c.includes("restaurant") ||
+        c.includes("fast food") ||
+        c.includes("food and drink") ||
+        c.includes("grocery") ||
+        c.includes("gas") ||
+        c.includes("fuel") ||
+        c.includes("shopping") ||
+        c.includes("general merchandise")
+    );
+
+  if (
+    isFoodGasShopping &&
+    !nameHas(subscriptionHints) &&
+    !nameHas(billHints)
+  ) {
+    return null;
+  }
+
   if (looksBill && !looksSubscription) return "bill";
   if (looksSubscription && !looksBill) return "subscription";
   if (nameHas(subscriptionHints)) return "subscription";
   if (nameHas(billHints)) return "bill";
-  return "subscription";
+  return null;
 }
 
 const toDollars = (n) => Math.round(Number(n || 0) * 100) / 100;
@@ -795,7 +853,7 @@ app.post("/api/create_link_token", async (req, res) => {
       country_codes: ["US"],
       language: "en",
       redirect_uri: PLAID_REDIRECT_URI,
-      // ✅ Request up to 365 days of transaction history for new Items
+      // Request up to 365 days of transaction history for new Items
       transactions: {
         days_requested: 365,
       },
@@ -1047,8 +1105,16 @@ app.get("/api/subscriptions", async (req, res) => {
 
     if (streams.length > 0) {
       const subs = [];
+      const now = new Date();
+
       for (const s of streams) {
-        if (classifyStream(s) !== "subscription") continue;
+        const kind = classifyStream(s);
+        if (kind !== "subscription") continue;
+
+        const lastDate = s.last_date || s.first_date || null;
+        if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) {
+          continue;
+        }
 
         const { days, cycle } = freqToInfo(s.frequency);
         const next =
@@ -1107,8 +1173,16 @@ app.get("/api/bills", async (req, res) => {
 
     if (streams.length > 0) {
       const bills = [];
+      const now = new Date();
+
       for (const s of streams) {
-        if (classifyStream(s) !== "bill") continue;
+        const kind = classifyStream(s);
+        if (kind !== "bill") continue;
+
+        const lastDate = s.last_date || s.first_date || null;
+        if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) {
+          continue;
+        }
 
         const { days } = freqToInfo(s.frequency);
         const next =
@@ -1176,8 +1250,14 @@ app.get("/api/debug/recurring", async (req, res) => {
 
     const subsStreams = [];
     const billsStreams = [];
+    const now = new Date();
+
     for (const s of streams) {
       const kind = classifyStream(s);
+      const lastDate = s.last_date || s.first_date || null;
+      const recentEnough =
+        !lastDate || daysBetween(lastDate, now) <= RECENT_DAYS_CUTOFF;
+
       const { days, cycle } = freqToInfo(s.frequency);
       const next =
         s.next_date ||
@@ -1192,6 +1272,7 @@ app.get("/api/debug/recurring", async (req, res) => {
         amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
         cycle: cycle === "annual" ? "annual" : "monthly",
         next,
+        recentEnough,
       };
       if (kind === "subscription") subsStreams.push(base);
       else if (kind === "bill") billsStreams.push(base);
