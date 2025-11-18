@@ -37,7 +37,11 @@ function withTimeout(promise, ms = 25000, label = "operation") {
 
 function toText(v) {
   if (typeof v === "string") return v;
-  try { return JSON.stringify(v); } catch { return String(v ?? ""); }
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v ?? "");
+  }
 }
 
 function sendError(res, e, status = 500) {
@@ -54,7 +58,9 @@ function sendPlaidError(res, err, fallbackStatus = 500) {
 
 /* Small date helpers */
 const toISO = (d) =>
-  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+    d.getDate()
+  ).padStart(2, "0")}`;
 
 const daysBetween = (a, b) => {
   const da = typeof a === "string" ? new Date(a) : a;
@@ -116,11 +122,14 @@ app.get("/api/env-check", (_req, res) =>
     redirectUri: PLAID_REDIRECT_URI || null,
     androidPackageName: ANDROID_PACKAGE_NAME || null,
     linkCustomization: LINK_CUSTOMIZATION || null,
-    using:
-      ANDROID_PACKAGE_NAME
-        ? `android_package_name=${ANDROID_PACKAGE_NAME}`
-        : (PLAID_REDIRECT_URI ? `redirect_uri=${PLAID_REDIRECT_URI}` : "(none)"),
-    hasOpenAI: !!(process.env.OPENAI_API_KEY || process.env.EXPO_PUBLIC_OPENAI_API_KEY),
+    using: ANDROID_PACKAGE_NAME
+      ? `android_package_name=${ANDROID_PACKAGE_NAME}`
+      : PLAID_REDIRECT_URI
+      ? `redirect_uri=${PLAID_REDIRECT_URI}`
+      : "(none)",
+    hasOpenAI: !!(
+      process.env.OPENAI_API_KEY || process.env.EXPO_PUBLIC_OPENAI_API_KEY
+    ),
   })
 );
 
@@ -130,7 +139,7 @@ app.get("/api/env-check", (_req, res) =>
 app.get("/plaid-oauth", (req, res) => {
   const scheme = "flowlyapp";
   const qs =
-    Object.keys(req.query || {}).length
+    Object.keys(req.query || {}).length > 0
       ? `?${new URLSearchParams(req.query).toString()}`
       : "";
   const appDeeplink = `${scheme}://plaid-oauth${qs}`;
@@ -156,36 +165,46 @@ app.post("/api/ai/chat", async (req, res) => {
   const { text, scopes } = req.body || {};
   if (!text) return res.status(400).json({ error: "Missing 'text'." });
 
-  const apiKey = process.env.OPENAI_API_KEY || process.env.EXPO_PUBLIC_OPENAI_API_KEY;
+  const apiKey =
+    process.env.OPENAI_API_KEY || process.env.EXPO_PUBLIC_OPENAI_API_KEY;
   if (!apiKey) return res.status(500).json({ error: "Missing OPENAI_API_KEY" });
 
   try {
-    const result = await withTimeout(async (signal) => {
-      const r = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: "gpt-5",
-          messages: [
-            { role: "system", content: "You are Flowly AI. Be concise and helpful." },
-            { role: "user", content: text },
-          ],
-          temperature: 0.4,
-        }),
-        signal,
-      });
-      if (!r.ok) {
-        const body = await r.text().catch(() => "");
-        const err = new Error(`Upstream ${r.status} ${r.statusText} ${body}`);
-        // @ts-ignore
-        err.status = r.status;
-        throw err;
-      }
-      return r.json();
-    }, 23000, "OpenAI request");
+    const result = await withTimeout(
+      async (signal) => {
+        const r = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            model: "gpt-5",
+            messages: [
+              {
+                role: "system",
+                content: "You are Flowly AI. Be concise and helpful.",
+              },
+              { role: "user", content: text },
+            ],
+            temperature: 0.4,
+          }),
+          signal,
+        });
+        if (!r.ok) {
+          const body = await r.text().catch(() => "");
+          const err = new Error(
+            `Upstream ${r.status} ${r.statusText} ${body}`
+          );
+          // @ts-ignore
+          err.status = r.status;
+          throw err;
+        }
+        return r.json();
+      },
+      23000,
+      "OpenAI request"
+    );
 
     const out = result?.choices?.[0]?.message?.content ?? "";
     return res.json({ text: out, usedScopes: scopes || {} });
@@ -204,7 +223,8 @@ const CACHE_TTL_MS = 60_000;
 
 function normalizeTxn(t) {
   const expense = t.amount > 0;
-  const pfcPrimary = t.personal_finance_category?.primary?.toLowerCase?.() || null;
+  const pfcPrimary =
+    t.personal_finance_category?.primary?.toLowerCase?.() || null;
   return {
     id: t.transaction_id,
     date: t.date,
@@ -263,30 +283,134 @@ async function getAllTransactionsOnce({ userId, access_token }) {
 
 // Whitelists (known good)
 const SUB_BRANDS = [
-  "netflix","spotify","hulu","disney","hbomax","max","youtube","youtube premium","apple.com/bill",
-  "adobe","microsoft","onedrive","dropbox","icloud","prime","audible","google","openai",
-  "canva","notion","github","xbox","playstation","nintendo","crunchyroll","pandora","paramount",
-  "peacock","showtime","headspace","calm","duolingo","uber one","lyft pink","hbo","paramount+","paramount plus"
+  "netflix",
+  "spotify",
+  "hulu",
+  "disney",
+  "hbomax",
+  "max",
+  "youtube",
+  "youtube premium",
+  "apple.com/bill",
+  "adobe",
+  "microsoft",
+  "onedrive",
+  "dropbox",
+  "icloud",
+  "prime",
+  "audible",
+  "google",
+  "openai",
+  "canva",
+  "notion",
+  "github",
+  "xbox",
+  "playstation",
+  "nintendo",
+  "crunchyroll",
+  "pandora",
+  "paramount",
+  "peacock",
+  "showtime",
+  "headspace",
+  "calm",
+  "duolingo",
+  "uber one",
+  "lyft pink",
+  "hbo",
+  "paramount+",
+  "paramount plus",
 ];
 
 const BILL_BRANDS = [
-  "xfinity","comcast","verizon","at&t","att","t-mobile","tmobile","spectrum","wow internet",
-  "geico","state farm","progressive","allstate","liberty mutual","usaa",
-  "edison","pg&e","pge","con edison","coned","duke energy","fpl","water","utilities","utility",
-  "mortgage","rent","loan","navient","nelnet"
+  "xfinity",
+  "comcast",
+  "verizon",
+  "at&t",
+  "att",
+  "t-mobile",
+  "tmobile",
+  "spectrum",
+  "wow internet",
+  "geico",
+  "state farm",
+  "progressive",
+  "allstate",
+  "liberty mutual",
+  "usaa",
+  "edison",
+  "pg&e",
+  "pge",
+  "con edison",
+  "coned",
+  "duke energy",
+  "fpl",
+  "water",
+  "utilities",
+  "utility",
+  "mortgage",
+  "rent",
+  "loan",
+  "navient",
+  "nelnet",
 ];
 
 // Obvious one-off retail/food/gas/grocery to exclude unless whitelisted
 const EXCLUDE_HINTS = [
-  "mcdonald","burger king","wendy's","taco bell","chipotle","starbucks","dunkin","subway",
-  "chick-fil-a","panda express","little caesars","domino","pizza hut","kfc","arby's","sonic",
-  "wawa","raceway","race trac","racetrac","shell","bp","chevron","marathon","exxon","valero","circle k","7-eleven","7 eleven",
-  "walmart","target","costco","safeway","kroger","heb","meijer","whole foods","aldi","publix","tom thumb","winco","food lion"
+  "mcdonald",
+  "burger king",
+  "wendy's",
+  "taco bell",
+  "chipotle",
+  "starbucks",
+  "dunkin",
+  "subway",
+  "chick-fil-a",
+  "panda express",
+  "little caesars",
+  "domino",
+  "pizza hut",
+  "kfc",
+  "arby's",
+  "sonic",
+  "wawa",
+  "raceway",
+  "race trac",
+  "racetrac",
+  "shell",
+  "bp",
+  "chevron",
+  "marathon",
+  "exxon",
+  "valero",
+  "circle k",
+  "7-eleven",
+  "7 eleven",
+  "walmart",
+  "target",
+  "costco",
+  "safeway",
+  "kroger",
+  "heb",
+  "meijer",
+  "whole foods",
+  "aldi",
+  "publix",
+  "tom thumb",
+  "winco",
+  "food lion",
 ];
 
 // PFC categories to exclude unless on whitelist
 const EXCLUDE_PFC = [
-  "restaurants","fast food","food and drink","gas","fuel","grocery","general merchandise","shopping"
+  "restaurants",
+  "fast food",
+  "food and drink",
+  "gas",
+  "fuel",
+  "grocery",
+  "general merchandise",
+  "shopping",
 ];
 
 function monthlyGaps(dates) {
@@ -310,7 +434,9 @@ function dateSpanDays(dates) {
   return daysBetween(sorted[0], sorted[sorted.length - 1]);
 }
 
-function nextMonthlyFrom(lastISO) { return addDays(lastISO, 30); }
+function nextMonthlyFrom(lastISO) {
+  return addDays(lastISO, 30);
+}
 
 function pickWebsiteFromNormalized(t) {
   if (t.website) return t.website;
@@ -324,7 +450,8 @@ function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
     name,
     amount: Math.abs(Number(amount || 0)),
     cycle, // 'monthly' | 'annual'
-    nextCharge: cycle === "monthly" ? nextMonthlyFrom(date) : addDays(date, 365),
+    nextCharge:
+      cycle === "monthly" ? nextMonthlyFrom(date) : addDays(date, 365),
     website: website || null,
     counterparties: counterparties || undefined,
     alerts: false,
@@ -355,7 +482,12 @@ function topCategoryPrimary(rows) {
   }
   let top = null;
   let max = 0;
-  for (const [k, v] of counts) if (v > max) { max = v; top = k; }
+  for (const [k, v] of counts) {
+    if (v > max) {
+      max = v;
+      top = k;
+    }
+  }
   return top;
 }
 
@@ -363,7 +495,8 @@ function coefVar(nums) {
   if (!nums.length) return Infinity;
   const mean = nums.reduce((a, b) => a + b, 0) / nums.length;
   if (mean === 0) return Infinity;
-  const variance = nums.reduce((s, x) => s + Math.pow(x - mean, 2), 0) / nums.length;
+  const variance =
+    nums.reduce((s, x) => s + Math.pow(x - mean, 2), 0) / nums.length;
   const std = Math.sqrt(variance);
   return std / Math.abs(mean);
 }
@@ -399,16 +532,14 @@ function deriveSubscriptionsFromTxns(txns) {
       isKnownSub && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
 
     const passesUnknown =
-      !isKnownSub &&
-      !isKnownBill &&
-      occ >= 3 &&
-      span >= 60 &&
-      gapsMonthly >= 1;
+      !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
 
-    const stable = (isKnownSub ? cv <= 0.40 : cv <= 0.30);
+    const stable = isKnownSub ? cv <= 0.4 : cv <= 0.3;
 
     if ((passesKnown || passesUnknown) && stable) {
-      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+      const latest = group.rows.sort(
+        (a, b) => new Date(b.date) - new Date(a.date)
+      )[0];
       out.push(
         buildItem({
           id: `sub:${key}:${Math.round(median * 100)}`,
@@ -454,14 +585,22 @@ function deriveBillsFromTxns(txns) {
     const occ = group.rows.length;
     const cv = coefVar(amounts);
 
-    const passesKnown = isKnownBill && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
-    const passesUnknown = !isKnownBill && !isKnownSub && occ >= 3 && span >= 60 && gapsMonthly >= 1;
+    const passesKnown =
+      isKnownBill && occ >= 2 && (gapsMonthly >= 1 || span >= 45);
+    const passesUnknown =
+      !isKnownBill &&
+      !isKnownSub &&
+      occ >= 3 &&
+      span >= 60 &&
+      gapsMonthly >= 1;
 
     // Bills can be more variable; allow higher CV
-    const stable = cv <= 0.60;
+    const stable = cv <= 0.6;
 
     if ((passesKnown || passesUnknown) && stable) {
-      const latest = group.rows.sort((a, b) => new Date(b.date) - new Date(a.date))[0];
+      const latest = group.rows.sort(
+        (a, b) => new Date(b.date) - new Date(a.date)
+      )[0];
       out.push(
         buildItem({
           id: `bill:${key}:${Math.round(median * 100)}`,
@@ -501,24 +640,75 @@ function freqToInfo(freq) {
 function classifyStream(s) {
   const name = (s.merchant_name || s.description || "").toLowerCase();
   const pfcPrimary = s.personal_finance_category?.primary?.toLowerCase?.() || "";
-  const categories = (Array.isArray(s.category) ? s.category : []).map((c) => String(c).toLowerCase());
+  const categories = (Array.isArray(s.category) ? s.category : []).map((c) =>
+    String(c).toLowerCase()
+  );
   const freq = String(s.frequency || "").toUpperCase();
 
   const subscriptionHints = [
-    "netflix","hulu","disney","spotify","youtube","openai","adobe",
-    "dropbox","onedrive","icloud","prime","audible","canva","notion",
-    "xbox","playstation","paramount","peacock","pandora","crunchyroll",
+    "netflix",
+    "hulu",
+    "disney",
+    "spotify",
+    "youtube",
+    "openai",
+    "adobe",
+    "dropbox",
+    "onedrive",
+    "icloud",
+    "prime",
+    "audible",
+    "canva",
+    "notion",
+    "xbox",
+    "playstation",
+    "paramount",
+    "peacock",
+    "pandora",
+    "crunchyroll",
   ];
   const billHints = [
-    "xfinity","comcast","verizon","t-mobile","tmobile","at&t","att",
-    "spectrum","geico","state farm","progressive","usaa","allstate",
-    "mortgage","rent","loan","utilities","utility","power","electric",
-    "water","gas","energy","duke energy","fpl","edison","pge","coned",
+    "xfinity",
+    "comcast",
+    "verizon",
+    "t-mobile",
+    "tmobile",
+    "at&t",
+    "att",
+    "spectrum",
+    "geico",
+    "state farm",
+    "progressive",
+    "usaa",
+    "allstate",
+    "mortgage",
+    "rent",
+    "loan",
+    "utilities",
+    "utility",
+    "power",
+    "electric",
+    "water",
+    "gas",
+    "energy",
+    "duke energy",
+    "fpl",
+    "edison",
+    "pge",
+    "coned",
   ];
 
   const nameHas = (arr) => arr.some((kw) => name.includes(kw));
   const catHas = (kw) => categories.some((c) => c.includes(kw));
-  const monthlyish = ["WEEKLY","BIWEEKLY","SEMI_MONTHLY","MONTHLY","QUARTERLY","ANNUALLY","YEARLY"].includes(freq);
+  const monthlyish = [
+    "WEEKLY",
+    "BIWEEKLY",
+    "SEMI_MONTHLY",
+    "MONTHLY",
+    "QUARTERLY",
+    "ANNUALLY",
+    "YEARLY",
+  ].includes(freq);
 
   const pfcLooksSubscription =
     pfcPrimary.includes("subscription") || pfcPrimary.includes("entertainment");
@@ -531,11 +721,22 @@ function classifyStream(s) {
     pfcPrimary.includes("utilities");
 
   const looksBill =
-    pfcLooksBill || nameHas(billHints) || catHas("utilities") || catHas("telecommunication") ||
-    catHas("insurance") || catHas("service") || catHas("mortgage") || catHas("rent") || catHas("loan");
+    pfcLooksBill ||
+    nameHas(billHints) ||
+    catHas("utilities") ||
+    catHas("telecommunication") ||
+    catHas("insurance") ||
+    catHas("service") ||
+    catHas("mortgage") ||
+    catHas("rent") ||
+    catHas("loan");
 
   const looksSubscription =
-    pfcLooksSubscription || (monthlyish && (nameHas(subscriptionHints) || catHas("subscription") || catHas("entertainment")));
+    pfcLooksSubscription ||
+    (monthlyish &&
+      (nameHas(subscriptionHints) ||
+        catHas("subscription") ||
+        catHas("entertainment")));
 
   if (looksBill && !looksSubscription) return "bill";
   if (looksSubscription && !looksBill) return "subscription";
@@ -560,7 +761,7 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
  * Plaid routes
  * ==========================================================================*/
 
-// Create Link Token — iOS-only; requests consent for recurring streams
+// Create Link Token — iOS-only
 app.post("/api/create_link_token", async (req, res) => {
   try {
     const client_user_id = String(req.body?.userId || "demo-user");
@@ -576,17 +777,20 @@ app.post("/api/create_link_token", async (req, res) => {
       user: { client_user_id },
       client_name: "Flowly",
       products: PRODUCTS,
-      additional_consented_products: ["recurring_transactions"],
       country_codes: ["US"],
       language: "en",
       redirect_uri: PLAID_REDIRECT_URI,
-      ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+      ...(LINK_CUSTOMIZATION
+        ? { link_customization_name: LINK_CUSTOMIZATION }
+        : {}),
     };
 
     // strip empties
     for (const k of Object.keys(payload)) {
       const v = payload[k];
-      if (v === "" || v == null || (Array.isArray(v) && v.length === 0)) delete payload[k];
+      if (v === "" || v == null || (Array.isArray(v) && v.length === 0)) {
+        delete payload[k];
+      }
     }
 
     console.log("linkTokenCreate keys:", Object.keys(payload).sort());
@@ -597,7 +801,7 @@ app.post("/api/create_link_token", async (req, res) => {
     const code = e?.response?.data?.error_code;
 
     if (code === "INVALID_FIELD") {
-      // Some institutions / environments don’t allow additional_consented_products.
+      // Retry without any optional extras (we already removed them, but keep a minimal retry)
       try {
         const client_user_id = String(req.body?.userId || "demo-user");
         const fallback = await plaid.linkTokenCreate({
@@ -607,9 +811,15 @@ app.post("/api/create_link_token", async (req, res) => {
           country_codes: ["US"],
           language: "en",
           redirect_uri: PLAID_REDIRECT_URI,
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+          ...(LINK_CUSTOMIZATION
+            ? { link_customization_name: LINK_CUSTOMIZATION }
+            : {}),
         });
-        return res.json({ link_token: fallback.data.link_token, fallback: true, platform: "ios" });
+        return res.json({
+          link_token: fallback.data.link_token,
+          fallback: true,
+          platform: "ios",
+        });
       } catch (e2) {
         return sendPlaidError(res, e2);
       }
@@ -625,9 +835,15 @@ app.post("/api/create_link_token", async (req, res) => {
           country_codes: ["US"],
           language: "en",
           redirect_uri: PLAID_REDIRECT_URI,
-          ...(LINK_CUSTOMIZATION ? { link_customization_name: LINK_CUSTOMIZATION } : {}),
+          ...(LINK_CUSTOMIZATION
+            ? { link_customization_name: LINK_CUSTOMIZATION }
+            : {}),
         });
-        return res.json({ link_token: retry.data.link_token, downgraded_to: "transactions", platform: "ios" });
+        return res.json({
+          link_token: retry.data.link_token,
+          downgraded_to: "transactions",
+          platform: "ios",
+        });
       } catch (e3) {
         return sendPlaidError(res, e3);
       }
@@ -642,7 +858,8 @@ app.post("/api/exchange_public_token", async (req, res) => {
   try {
     const userId = String(req.body?.userId || "demo-user");
     const { public_token } = req.body || {};
-    if (!public_token) return res.status(400).json({ error: "missing_public_token" });
+    if (!public_token)
+      return res.status(400).json({ error: "missing_public_token" });
 
     const r = await plaid.itemPublicTokenExchange({ public_token });
     const { access_token, item_id } = r.data;
@@ -659,9 +876,13 @@ app.get("/api/transactions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
-    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+    if (!user?.access_token)
+      return res.status(400).json({ error: "no_linked_item" });
 
-    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
+    const txns = await getAllTransactionsOnce({
+      userId,
+      access_token: user.access_token,
+    });
     res.json({ txns });
   } catch (e) {
     return sendPlaidError(res, e);
@@ -673,9 +894,12 @@ app.get("/api/accounts", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
-    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+    if (!user?.access_token)
+      return res.status(400).json({ error: "no_linked_item" });
 
-    const resp = await plaid.accountsBalanceGet({ access_token: user.access_token });
+    const resp = await plaid.accountsBalanceGet({
+      access_token: user.access_token,
+    });
 
     const accounts = (resp.data.accounts || []).map((a) => ({
       id: a.account_id,
@@ -705,12 +929,23 @@ app.get("/api/accounts", async (req, res) => {
 app.post("/api/plaid/webhook", async (req, res) => {
   try {
     const { webhook_type, webhook_code, item_id } = req.body || {};
-    if (webhook_type === "TRANSACTIONS" && webhook_code === "SYNC_UPDATES_AVAILABLE") {
+    if (
+      webhook_type === "TRANSACTIONS" &&
+      webhook_code === "SYNC_UPDATES_AVAILABLE"
+    ) {
       const userId = await getUserIdByItemId(item_id);
-      console.log("SYNC_UPDATES_AVAILABLE for item", item_id, "user", userId);
+      console.log(
+        "SYNC_UPDATES_AVAILABLE for item",
+        item_id,
+        "user",
+        userId
+      );
       if (userId) STREAMS_CACHE.delete(userId); // bust streams cache on sync updates too
     }
-    if (webhook_type === "TRANSACTIONS" && webhook_code === "RECURRING_TRANSACTIONS_UPDATE") {
+    if (
+      webhook_type === "TRANSACTIONS" &&
+      webhook_code === "RECURRING_TRANSACTIONS_UPDATE"
+    ) {
       const userId = await getUserIdByItemId(item_id);
       if (userId) STREAMS_CACHE.delete(userId);
     }
@@ -726,9 +961,13 @@ app.get("/api/budget_snapshot", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
-    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+    if (!user?.access_token)
+      return res.status(400).json({ error: "no_linked_item" });
 
-    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
+    const txns = await getAllTransactionsOnce({
+      userId,
+      access_token: user.access_token,
+    });
     const [subs, bills] = await Promise.all([
       deriveSubscriptionsFromTxns(txns),
       deriveBillsFromTxns(txns),
@@ -768,13 +1007,16 @@ app.get("/api/subscriptions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
-    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+    if (!user?.access_token)
+      return res.status(400).json({ error: "no_linked_item" });
 
     let streams = [];
     try {
-      streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
+      streams = await getRecurringStreamsOnce({
+        userId,
+        access_token: user.access_token,
+      });
     } catch (e) {
-      // swallow and fallback
       streams = [];
     }
 
@@ -782,10 +1024,16 @@ app.get("/api/subscriptions", async (req, res) => {
       const subs = [];
       for (const s of streams) {
         if (classifyStream(s) !== "subscription") continue;
+
         const { days, cycle } = freqToInfo(s.frequency);
         const next =
           s.next_date ||
-          (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
+          (s.last_date
+            ? addDays(s.last_date, days)
+            : s.first_date
+            ? addDays(s.first_date, days)
+            : toISO(new Date()));
+
         subs.push({
           id: s.stream_id,
           name: s.merchant_name || s.description || "Subscription",
@@ -799,11 +1047,15 @@ app.get("/api/subscriptions", async (req, res) => {
           counterparties: s.counterparties || undefined,
         });
       }
+
       return res.json({ subscriptions: subs });
     }
 
     // Fallback
-    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
+    const txns = await getAllTransactionsOnce({
+      userId,
+      access_token: user.access_token,
+    });
     const subs = deriveSubscriptionsFromTxns(txns);
     return res.json({ subscriptions: subs });
   } catch (e) {
@@ -815,11 +1067,15 @@ app.get("/api/bills", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
-    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+    if (!user?.access_token)
+      return res.status(400).json({ error: "no_linked_item" });
 
     let streams = [];
     try {
-      streams = await getRecurringStreamsOnce({ userId, access_token: user.access_token });
+      streams = await getRecurringStreamsOnce({
+        userId,
+        access_token: user.access_token,
+      });
     } catch (e) {
       streams = [];
     }
@@ -828,10 +1084,16 @@ app.get("/api/bills", async (req, res) => {
       const bills = [];
       for (const s of streams) {
         if (classifyStream(s) !== "bill") continue;
+
         const { days } = freqToInfo(s.frequency);
         const next =
           s.next_date ||
-          (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
+          (s.last_date
+            ? addDays(s.last_date, days)
+            : s.first_date
+            ? addDays(s.first_date, days)
+            : toISO(new Date()));
+
         bills.push({
           id: s.stream_id,
           name: s.merchant_name || s.description || "Bill",
@@ -845,11 +1107,15 @@ app.get("/api/bills", async (req, res) => {
           counterparties: s.counterparties || undefined,
         });
       }
+
       return res.json({ bills });
     }
 
     // Fallback
-    const txns = await getAllTransactionsOnce({ userId, access_token: user.access_token });
+    const txns = await getAllTransactionsOnce({
+      userId,
+      access_token: user.access_token,
+    });
     const bills = deriveBillsFromTxns(txns).map((b) => ({
       id: b.id,
       name: b.name,
@@ -872,7 +1138,8 @@ app.get("/api/debug/recurring", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
     const user = await getUserById(userId);
-    if (!user?.access_token) return res.status(400).json({ error: "no_linked_item" });
+    if (!user?.access_token)
+      return res.status(400).json({ error: "no_linked_item" });
 
     const [streams, txns] = await Promise.all([
       getRecurringStreamsOnce({ userId, access_token: user.access_token }),
@@ -889,7 +1156,11 @@ app.get("/api/debug/recurring", async (req, res) => {
       const { days, cycle } = freqToInfo(s.frequency);
       const next =
         s.next_date ||
-        (s.last_date ? addDays(s.last_date, days) : (s.first_date ? addDays(s.first_date, days) : toISO(new Date())));
+        (s.last_date
+          ? addDays(s.last_date, days)
+          : s.first_date
+          ? addDays(s.first_date, days)
+          : toISO(new Date()));
       const base = {
         id: s.stream_id,
         name: s.merchant_name || s.description || "Recurring",
