@@ -296,7 +296,7 @@ async function getAllTransactionsOnce({ userId, access_token }) {
  * Recurring detection (heuristics fallback)
  * ==========================================================================*/
 
-// Whitelists (known good)
+// Whitelists (known good subscriptions)
 const SUB_BRANDS = [
   "netflix",
   "spotify",
@@ -337,6 +337,7 @@ const SUB_BRANDS = [
   "paramount plus",
 ];
 
+// Whitelists (known good bills)
 const BILL_BRANDS = [
   "xfinity",
   "comcast",
@@ -370,8 +371,9 @@ const BILL_BRANDS = [
   "nelnet",
 ];
 
-// Obvious one-off retail/food/gas/grocery to exclude unless whitelisted
+// Obvious one-off retail/food/gas/grocery/transport/P2P to exclude unless whitelisted
 const EXCLUDE_HINTS = [
+  // Fast food / chains (some already existed)
   "mcdonald",
   "burger king",
   "wendy's",
@@ -388,6 +390,20 @@ const EXCLUDE_HINTS = [
   "kfc",
   "arby's",
   "sonic",
+  "whataburger",
+  "olive garden",
+  "wing",
+  "bbq",
+  "bar & grill",
+  "grill",
+  "pub",
+  "tavern",
+  "bistro",
+  "cafe",
+  "coffee",
+  "kitchen",
+
+  // Gas / convenience
   "wawa",
   "raceway",
   "race trac",
@@ -401,6 +417,8 @@ const EXCLUDE_HINTS = [
   "circle k",
   "7-eleven",
   "7 eleven",
+
+  // General shopping / big box
   "walmart",
   "target",
   "costco",
@@ -414,6 +432,24 @@ const EXCLUDE_HINTS = [
   "tom thumb",
   "winco",
   "food lion",
+
+  // Rideshare / delivery
+  "uber ",
+  " uber",
+  "lyft",
+  "doordash",
+  "door dash",
+  "grubhub",
+  "instacart",
+  "postmates",
+  "uber eats",
+
+  // P2P / wallets
+  "venmo",
+  "cash app",
+  "cashapp",
+  "paypal",
+  "zelle",
 ];
 
 // PFC categories to exclude unless on whitelist
@@ -440,10 +476,6 @@ function monthlyGaps(dates) {
     if (gap >= 25 && gap <= 35) count += 1;
   }
   return count;
-}
-
-function looksMonthly(dates) {
-  return monthlyGaps(dates) >= 1;
 }
 
 function dateSpanDays(dates) {
@@ -481,7 +513,7 @@ function groupByMerchantNormalized(txns) {
   for (const t of txns) {
     const merch = (t.merchant || "Unknown").trim();
     const key = merch.toLowerCase();
-    if (!map.has(key)) map.set(key, { name: merch, rows: [] });
+    if (!map.has(key)) map.set(key, { name: merch, key, rows: [] });
     map.get(key).rows.push(t);
   }
   return map;
@@ -519,6 +551,35 @@ function coefVar(nums) {
   return std / Math.abs(mean);
 }
 
+// Bill-ish category check for normalized PFC
+function isBillishPFC(pfc) {
+  const p = (pfc || "").toLowerCase();
+  if (!p) return false;
+  return (
+    p.includes("utility") ||
+    p.includes("utilities") ||
+    p.includes("energy") ||
+    p.includes("electric") ||
+    p.includes("gas") ||
+    p.includes("water") ||
+    p.includes("telecommunication") ||
+    p.includes("internet") ||
+    p.includes("wireless") ||
+    p.includes("phone") ||
+    p.includes("cellular") ||
+    p.includes("insurance") ||
+    p.includes("mortgage") ||
+    p.includes("rent") ||
+    p.includes("loan") ||
+    p.includes("student loan") ||
+    p.includes("service") ||
+    p.includes("services") ||
+    p.includes("tax") ||
+    p.includes("tuition") ||
+    p.includes("education")
+  );
+}
+
 function deriveSubscriptionsFromTxns(txns) {
   const expenses = txns
     .filter((t) => t.type === "expense")
@@ -528,13 +589,13 @@ function deriveSubscriptionsFromTxns(txns) {
   const out = [];
   const now = new Date();
 
-  for (const [key, group] of byMerchant.entries()) {
-    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
+  for (const [, group] of byMerchant.entries()) {
+    const { key, name, rows } = group;
+    const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
-    const dates = group.rows.map((r) => r.date);
+    const dates = rows.map((r) => r.date);
     const span = dateSpanDays(dates);
-    const gapsMonthly = monthlyGaps(dates);
-    const name = group.name;
+    const nameLower = name.toLowerCase();
 
     // Last charge recency filter (drop old stuff)
     const lastDate =
@@ -547,28 +608,29 @@ function deriveSubscriptionsFromTxns(txns) {
         : null;
     if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
 
-    const topPFC = topCategoryPrimary(group.rows) || "";
-    const isKnownSub = merchantMatches(key, SUB_BRANDS);
-    const isKnownBill = merchantMatches(key, BILL_BRANDS);
-    const excludedByName = merchantMatches(key, EXCLUDE_HINTS);
+    const topPFC = topCategoryPrimary(rows) || "";
+    const isKnownSub = merchantMatches(nameLower, SUB_BRANDS);
+    const isKnownBill = merchantMatches(nameLower, BILL_BRANDS);
+    const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
 
-    // Exclude food/gas/shopping unless explicitly whitelisted
+    // Exclude food/gas/shopping/venmo/uber etc unless explicitly whitelisted as a subscription
     if ((excludedByName || excludedByPFC) && !isKnownSub) continue;
 
-    const occ = group.rows.length;
+    const occ = rows.length;
     const cv = coefVar(amounts);
 
     // Known subs: be more lenient, just require at least 1 recent charge
     const passesKnown = isKnownSub && occ >= 1;
 
+    const gapsMonthly = monthlyGaps(dates);
     const passesUnknown =
       !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
 
     const stable = isKnownSub ? cv <= 0.6 : cv <= 0.3;
 
     if ((passesKnown || passesUnknown) && stable) {
-      const latest = group.rows.sort(
+      const latest = rows.sort(
         (a, b) => new Date(b.date) - new Date(a.date)
       )[0];
       out.push(
@@ -590,7 +652,7 @@ function deriveSubscriptionsFromTxns(txns) {
   return Array.from(uniq.values()).slice(0, 50);
 }
 
-function deriveBillsFromTxns(txns) {
+function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
   const expenses = txns
     .filter((t) => t.type === "expense")
     .map((t) => ({ ...t, amount: Math.abs(t.amount) }));
@@ -599,12 +661,17 @@ function deriveBillsFromTxns(txns) {
   const out = [];
   const now = new Date();
 
-  for (const [key, group] of byMerchant.entries()) {
-    const name = group.name;
-    const dates = group.rows.map((r) => r.date);
+  for (const [, group] of byMerchant.entries()) {
+    const { name, key, rows } = group;
+    const nameLower = name.toLowerCase();
+
+    // Don't show something as a bill if we've already decided it's a subscription
+    if (subscriptionMerchantNames.has(nameLower)) continue;
+
+    const dates = rows.map((r) => r.date);
     const span = dateSpanDays(dates);
     const gapsMonthly = monthlyGaps(dates);
-    const amounts = group.rows.map((r) => r.amount).sort((a, b) => a - b);
+    const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
 
     // Last charge recency filter (drop old bills)
@@ -618,30 +685,40 @@ function deriveBillsFromTxns(txns) {
         : null;
     if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
 
-    const topPFC = topCategoryPrimary(group.rows) || "";
-    const isKnownBill = merchantMatches(key, BILL_BRANDS);
-    const isKnownSub = merchantMatches(key, SUB_BRANDS);
-    const excludedByName = merchantMatches(key, EXCLUDE_HINTS);
+    const topPFC = topCategoryPrimary(rows) || "";
+    const isKnownBill = merchantMatches(nameLower, BILL_BRANDS);
+    const isKnownSub = merchantMatches(nameLower, SUB_BRANDS);
+    const billishByCategory = isBillishPFC(topPFC);
+
+    const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
+
+    // Exclude food/gas/shopping/venmo/uber, etc., unless explicitly whitelisted as a bill
     if ((excludedByName || excludedByPFC) && !isKnownBill) continue;
 
-    const occ = group.rows.length;
+    const occ = rows.length;
     const cv = coefVar(amounts);
 
-    const passesKnown =
-      isKnownBill && occ >= 1 && (gapsMonthly >= 1 || span >= 45);
-    const passesUnknown =
-      !isKnownBill &&
-      !isKnownSub &&
-      occ >= 3 &&
-      span >= 60 &&
-      gapsMonthly >= 1;
+    let passes = false;
 
-    // Bills can be more variable; allow higher CV
+    if (isKnownBill) {
+      // Known bill brands (utilities, insurance, etc.) – allow even if new,
+      // but still want at least 1 occurrence
+      passes = occ >= 1 && span >= 0;
+    } else if (billishByCategory && !isKnownSub) {
+      // Category looks like a bill (utilities, loans, rent, etc.)
+      // Can be new, but should appear at least twice (e.g. first two months)
+      passes = occ >= 2 && span >= 25;
+    } else if (!isKnownSub) {
+      // Generic recurring stuff – very strict
+      passes = occ >= 3 && span >= 60 && gapsMonthly >= 1;
+    }
+
+    // Bills can be a bit more variable
     const stable = cv <= 0.7;
 
-    if ((passesKnown || passesUnknown) && stable) {
-      const latest = group.rows.sort(
+    if (passes && stable) {
+      const latest = rows.sort(
         (a, b) => new Date(b.date) - new Date(a.date)
       )[0];
       out.push(
@@ -709,6 +786,8 @@ function classifyStream(s) {
     "peacock",
     "pandora",
     "crunchyroll",
+    "uber one",
+    "lyft pink",
   ];
   const billHints = [
     "xfinity",
@@ -803,8 +882,22 @@ function classifyStream(s) {
         c.includes("general merchandise")
     );
 
+  const isP2POrRideshare =
+    name.includes("venmo") ||
+    name.includes("cash app") ||
+    name.includes("cashapp") ||
+    name.includes("paypal") ||
+    name.includes("zelle") ||
+    (name.includes("uber") && !name.includes("uber one")) ||
+    (name.includes("lyft") && !name.includes("lyft pink")) ||
+    name.includes("doordash") ||
+    name.includes("door dash") ||
+    name.includes("grubhub") ||
+    name.includes("instacart") ||
+    name.includes("postmates");
+
   if (
-    isFoodGasShopping &&
+    (isFoodGasShopping || isP2POrRideshare) &&
     !nameHas(subscriptionHints) &&
     !nameHas(billHints)
   ) {
@@ -1051,10 +1144,12 @@ app.get("/api/budget_snapshot", async (req, res) => {
       userId,
       access_token: user.access_token,
     });
-    const [subs, bills] = await Promise.all([
-      deriveSubscriptionsFromTxns(txns),
-      deriveBillsFromTxns(txns),
-    ]);
+
+    const subs = deriveSubscriptionsFromTxns(txns);
+    const subMerchantNames = new Set(
+      subs.map((s) => (s.name || "").toLowerCase().trim())
+    );
+    const bills = deriveBillsFromTxns(txns, subMerchantNames);
 
     res.json({
       txns,
@@ -1210,12 +1305,16 @@ app.get("/api/bills", async (req, res) => {
       return res.json({ bills });
     }
 
-    // Fallback
+    // Fallback — use subs to avoid duplicates
     const txns = await getAllTransactionsOnce({
       userId,
       access_token: user.access_token,
     });
-    const bills = deriveBillsFromTxns(txns).map((b) => ({
+    const subsFallback = deriveSubscriptionsFromTxns(txns);
+    const subMerchantNames = new Set(
+      subsFallback.map((s) => (s.name || "").toLowerCase().trim())
+    );
+    const bills = deriveBillsFromTxns(txns, subMerchantNames).map((b) => ({
       id: b.id,
       name: b.name,
       amount: b.amount,
@@ -1246,7 +1345,10 @@ app.get("/api/debug/recurring", async (req, res) => {
     ]);
 
     const subsFallback = deriveSubscriptionsFromTxns(txns);
-    const billsFallback = deriveBillsFromTxns(txns);
+    const subMerchantNames = new Set(
+      subsFallback.map((s) => (s.name || "").toLowerCase().trim())
+    );
+    const billsFallback = deriveBillsFromTxns(txns, subMerchantNames);
 
     const subsStreams = [];
     const billsStreams = [];
