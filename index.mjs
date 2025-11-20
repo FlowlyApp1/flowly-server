@@ -371,9 +371,9 @@ const BILL_BRANDS = [
   "nelnet",
 ];
 
-// Obvious one-off retail/food/gas/grocery/transport/P2P/auto to exclude unless whitelisted
+// Obvious one-off retail/food/gas/grocery/transport/P2P to exclude unless whitelisted
 const EXCLUDE_HINTS = [
-  // Fast food / chains
+  // Fast food / chains (some already existed)
   "mcdonald",
   "burger king",
   "wendy's",
@@ -434,7 +434,8 @@ const EXCLUDE_HINTS = [
   "food lion",
 
   // Rideshare / delivery
-  "uber", // generic uber, will still allow "uber one" via whitelist
+  "uber ",
+  " uber",
   "lyft",
   "doordash",
   "door dash",
@@ -449,16 +450,6 @@ const EXCLUDE_HINTS = [
   "cashapp",
   "paypal",
   "zelle",
-
-  // Auto parts / auto stores
-  "oreilly",
-  "o'reilly",
-  "o reilly",
-  "autozone",
-  "auto zone",
-  "advance auto",
-  "napa auto",
-  "napa parts",
 ];
 
 // PFC categories to exclude unless on whitelist
@@ -471,14 +462,6 @@ const EXCLUDE_PFC = [
   "grocery",
   "general merchandise",
   "shopping",
-  "dining",
-  "bar",
-  "alcohol",
-  "auto",
-  "automotive",
-  "auto parts",
-  "car wash",
-  "transportation",
 ];
 
 // Consider a subscription/bill "stale" if last charge older than this
@@ -631,7 +614,7 @@ function deriveSubscriptionsFromTxns(txns) {
     const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
 
-    // Exclude food/gas/shopping/uber/venmo/auto etc unless explicitly whitelisted as a subscription
+    // Exclude food/gas/shopping/venmo/uber etc unless explicitly whitelisted as a subscription
     if ((excludedByName || excludedByPFC) && !isKnownSub) continue;
 
     const occ = rows.length;
@@ -654,7 +637,7 @@ function deriveSubscriptionsFromTxns(txns) {
         buildItem({
           id: `sub:${key}:${Math.round(median * 100)}`,
           name,
-          amount: median, // subs are usually fixed; median is fine
+          amount: median,
           date: latest.date,
           cycle: "monthly",
           website: pickWebsiteFromNormalized(latest),
@@ -686,20 +669,20 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
     if (subscriptionMerchantNames.has(nameLower)) continue;
 
     const dates = rows.map((r) => r.date);
+    const span = dateSpanDays(dates);
+    const gapsMonthly = monthlyGaps(dates);
     const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
 
-    // Use latest transaction for amount + recency
-    if (!rows.length) continue;
-    const latest = rows.reduce((latestRow, r) =>
-      new Date(r.date) > new Date(latestRow.date) ? r : latestRow
-    , rows[0]);
-
-    const lastDate = latest.date;
-    const span = dateSpanDays(dates);
-    const gapsMonthly = monthlyGaps(dates);
-
     // Last charge recency filter (drop old bills)
+    const lastDate =
+      dates.length > 0
+        ? dates.reduce(
+            (latest, d) =>
+              new Date(d) > new Date(latest) ? d : latest,
+            dates[0]
+          )
+        : null;
     if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
 
     const topPFC = topCategoryPrimary(rows) || "";
@@ -710,7 +693,7 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
     const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
 
-    // Exclude food/gas/shopping/venmo/uber/auto, etc., unless explicitly whitelisted as a bill
+    // Exclude food/gas/shopping/venmo/uber, etc., unless explicitly whitelisted as a bill
     if ((excludedByName || excludedByPFC) && !isKnownBill) continue;
 
     const occ = rows.length;
@@ -721,7 +704,7 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
     if (isKnownBill) {
       // Known bill brands (utilities, insurance, etc.) – allow even if new,
       // but still want at least 1 occurrence
-      passes = occ >= 1;
+      passes = occ >= 1 && span >= 0;
     } else if (billishByCategory && !isKnownSub) {
       // Category looks like a bill (utilities, loans, rent, etc.)
       // Can be new, but should appear at least twice (e.g. first two months)
@@ -735,11 +718,14 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
     const stable = cv <= 0.7;
 
     if (passes && stable) {
+      const latest = rows.sort(
+        (a, b) => new Date(b.date) - new Date(a.date)
+      )[0];
       out.push(
         buildItem({
           id: `bill:${key}:${Math.round(median * 100)}`,
           name,
-          amount: latest.amount, // show latest bill amount, not median
+          amount: median,
           date: latest.date,
           cycle: "monthly",
           website: pickWebsiteFromNormalized(latest),
@@ -771,6 +757,12 @@ function freqToInfo(freq) {
   return { days: 30, cycle: "monthly" };
 }
 
+/**
+ * classifyStream
+ *  - Reuses the same brand whitelists / exclude lists / PFC logic as the
+ *    heuristic engine, so streams behave more like budget_snapshot.
+ *  - Returns "subscription", "bill", or null to drop.
+ */
 function classifyStream(s) {
   const name = (s.merchant_name || s.description || "").toLowerCase();
   const pfcPrimary = s.personal_finance_category?.primary?.toLowerCase?.() || "";
@@ -779,63 +771,6 @@ function classifyStream(s) {
   );
   const freq = String(s.frequency || "").toUpperCase();
 
-  const subscriptionHints = [
-    "netflix",
-    "hulu",
-    "disney",
-    "spotify",
-    "youtube",
-    "openai",
-    "adobe",
-    "dropbox",
-    "onedrive",
-    "icloud",
-    "prime",
-    "audible",
-    "canva",
-    "notion",
-    "xbox",
-    "playstation",
-    "paramount",
-    "peacock",
-    "pandora",
-    "crunchyroll",
-    "uber one",
-    "lyft pink",
-  ];
-  const billHints = [
-    "xfinity",
-    "comcast",
-    "verizon",
-    "t-mobile",
-    "tmobile",
-    "at&t",
-    "att",
-    "spectrum",
-    "geico",
-    "state farm",
-    "progressive",
-    "usaa",
-    "allstate",
-    "mortgage",
-    "rent",
-    "loan",
-    "utilities",
-    "utility",
-    "power",
-    "electric",
-    "water",
-    "gas",
-    "energy",
-    "duke energy",
-    "fpl",
-    "edison",
-    "pge",
-    "coned",
-  ];
-
-  const nameHas = (arr) => arr.some((kw) => name.includes(kw));
-  const catHas = (kw) => categories.some((c) => c.includes(kw));
   const monthlyish = [
     "WEEKLY",
     "BIWEEKLY",
@@ -846,93 +781,64 @@ function classifyStream(s) {
     "YEARLY",
   ].includes(freq);
 
-  const pfcLooksSubscription =
-    pfcPrimary.includes("subscription") || pfcPrimary.includes("entertainment");
-  const pfcLooksBill =
-    pfcPrimary.includes("services") ||
-    pfcPrimary.includes("telecommunication") ||
-    pfcPrimary.includes("insurance") ||
-    pfcPrimary.includes("rent") ||
-    pfcPrimary.includes("loan") ||
-    pfcPrimary.includes("utilities");
+  const isKnownSub = merchantMatches(name, SUB_BRANDS);
+  const isKnownBill = merchantMatches(name, BILL_BRANDS);
 
-  const looksBill =
-    pfcLooksBill ||
-    nameHas(billHints) ||
-    catHas("utilities") ||
-    catHas("telecommunication") ||
-    catHas("insurance") ||
-    catHas("service") ||
-    catHas("mortgage") ||
-    catHas("rent") ||
-    catHas("loan");
+  const excludedByName = merchantMatches(name, EXCLUDE_HINTS);
+  const excludedByPFC = EXCLUDE_PFC.some(
+    (c) =>
+      pfcPrimary.includes(c) ||
+      categories.some((cat) => cat.includes(c))
+  );
 
-  const looksSubscription =
-    pfcLooksSubscription ||
-    (monthlyish &&
-      (nameHas(subscriptionHints) ||
-        catHas("subscription") ||
-        catHas("entertainment")));
-
-  // Filter obvious food/gas/shopping merchants unless whitelisted
-  const isFoodGasShopping =
-    pfcPrimary.includes("restaurant") ||
-    pfcPrimary.includes("fast food") ||
-    pfcPrimary.includes("food and drink") ||
-    pfcPrimary.includes("grocery") ||
-    pfcPrimary.includes("gas") ||
-    pfcPrimary.includes("fuel") ||
-    pfcPrimary.includes("shopping") ||
-    pfcPrimary.includes("general merchandise") ||
-    categories.some(
-      (c) =>
-        c.includes("restaurant") ||
-        c.includes("fast food") ||
-        c.includes("food and drink") ||
-        c.includes("grocery") ||
-        c.includes("gas") ||
-        c.includes("fuel") ||
-        c.includes("shopping") ||
-        c.includes("general merchandise")
-    );
-
-  const isAutoStore =
-    pfcPrimary.includes("auto") ||
-    pfcPrimary.includes("automotive") ||
-    pfcPrimary.includes("auto parts") ||
-    name.includes("oreilly") ||
-    name.includes("o'reilly") ||
-    name.includes("auto zone") ||
-    name.includes("autozone") ||
-    name.includes("advance auto") ||
-    name.includes("napa auto");
-
-  const isP2POrRideshare =
-    name.includes("venmo") ||
-    name.includes("cash app") ||
-    name.includes("cashapp") ||
-    name.includes("paypal") ||
-    name.includes("zelle") ||
-    (name.includes("uber") && !name.includes("uber one")) ||
-    (name.includes("lyft") && !name.includes("lyft pink")) ||
-    name.includes("doordash") ||
-    name.includes("door dash") ||
-    name.includes("grubhub") ||
-    name.includes("instacart") ||
-    name.includes("postmates");
-
-  if (
-    (isFoodGasShopping || isP2POrRideshare || isAutoStore) &&
-    !nameHas(subscriptionHints) &&
-    !nameHas(billHints)
-  ) {
+  // If this looks like obvious food/gas/shopping/venmo/uber/etc AND is not on
+  // a whitelist, drop it up front.
+  if ((excludedByName || excludedByPFC) && !isKnownSub && !isKnownBill) {
     return null;
   }
 
+  // Bill-ish by PFC or categories
+  const billishByCategory =
+    isBillishPFC(pfcPrimary) ||
+    categories.some((cat) => isBillishPFC(cat));
+
+  // Subscription-ish PFC/categories
+  const pfcLooksSubscription =
+    pfcPrimary.includes("subscription") ||
+    pfcPrimary.includes("entertainment") ||
+    categories.some(
+      (c) => c.includes("subscription") || c.includes("entertainment")
+    );
+
+  // Strong signals
+  if (isKnownBill && !isKnownSub) return "bill";
+  if (isKnownSub && !isKnownBill) return "subscription";
+
+  // If it's not at least roughly monthly, and not whitelisted, ignore.
+  if (!monthlyish && !isKnownSub && !isKnownBill) {
+    return null;
+  }
+
+  // Category-driven classification
+  const looksBill =
+    billishByCategory ||
+    isKnownBill ||
+    categories.some(
+      (c) =>
+        c.includes("utilities") ||
+        c.includes("telecommunication") ||
+        c.includes("insurance") ||
+        c.includes("mortgage") ||
+        c.includes("rent") ||
+        c.includes("loan")
+    );
+
+  const looksSubscription = pfcLooksSubscription || isKnownSub;
+
   if (looksBill && !looksSubscription) return "bill";
   if (looksSubscription && !looksBill) return "subscription";
-  if (nameHas(subscriptionHints)) return "subscription";
-  if (nameHas(billHints)) return "bill";
+
+  // If we couldn't confidently classify, drop it instead of guessing.
   return null;
 }
 
