@@ -224,13 +224,16 @@ function normalizeTxn(t) {
   const expense = t.amount > 0;
   const pfcPrimary =
     t.personal_finance_category?.primary?.toLowerCase?.() || null;
+
+  const merchantName = t.merchant_name || t.name || "Transaction";
+
   return {
     id: t.transaction_id,
     date: t.date,
     amount: expense ? -Math.abs(t.amount) : Math.abs(t.amount),
     categoryId: pfcPrimary || "uncategorized",
     pfcPrimary,
-    merchant: t.merchant_name || t.name || "Transaction",
+    merchant: merchantName,
     normalizedName: normalizeMerchant(merchantName),
     type: expense ? "expense" : "income",
     website: t.website,
@@ -496,6 +499,7 @@ function pickWebsiteFromNormalized(t) {
 }
 
 function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
+  const norm = normalizeMerchant(name);
   return {
     id,
     name,
