@@ -1063,7 +1063,7 @@ app.post("/api/plaid/webhook", async (req, res) => {
   }
 });
 
-/* ===== One-shot snapshot (txns + derived subs + derived bills) ===== */
+/* ===== One-shot snapshot (txns + derived subs + derived bills, with streams) ===== */
 app.get("/api/budget_snapshot", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
@@ -1071,40 +1071,128 @@ app.get("/api/budget_snapshot", async (req, res) => {
     if (!user?.access_token)
       return res.status(400).json({ error: "no_linked_item" });
 
+    // 1) Always: 12 months of normalized transactions
     const txns = await getAllTransactionsOnce({
       userId,
       access_token: user.access_token,
     });
 
-    const subs = deriveSubscriptionsFromTxns(txns);
-    const subMerchantNames = new Set(
-      subs.map((s) => (s.name || "").toLowerCase().trim())
-    );
-    const bills = deriveBillsFromTxns(txns, subMerchantNames);
+    const lower = (s) => (s || "").toLowerCase().trim();
+
+    // 2) Try recurring streams once (subscriptions + bills)
+    let streamSubs = [];
+    let streamBills = [];
+    try {
+      const streams = await getRecurringStreamsOnce({
+        userId,
+        access_token: user.access_token,
+      });
+      if (Array.isArray(streams) && streams.length > 0) {
+        const now = new Date();
+
+        for (const s of streams) {
+          const kind = classifyStream(s);
+          if (!kind) continue;
+
+          const lastDate = s.last_date || s.first_date || null;
+          if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) {
+            continue;
+          }
+
+          const { days, cycle } = freqToInfo(s.frequency);
+          const next =
+            s.next_date ||
+            (s.last_date
+              ? addDays(s.last_date, days)
+              : s.first_date
+              ? addDays(s.first_date, days)
+              : toISO(new Date()));
+
+          if (kind === "subscription") {
+            streamSubs.push({
+              id: s.stream_id,
+              name: s.merchant_name || s.description || "Subscription",
+              amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
+              cycle: cycle === "annual" ? "annual" : "monthly",
+              nextCharge: next,
+              isPaused: s.is_active === false,
+              alerts: false,
+              website: s.website || null,
+              logo_url: s.logo_url || undefined,
+              counterparties: s.counterparties || undefined,
+            });
+          } else if (kind === "bill") {
+            streamBills.push({
+              id: s.stream_id,
+              name: s.merchant_name || s.description || "Bill",
+              amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
+              dueDate: next,
+              autopay: false,
+              variable: false,
+              alerts: false,
+              website: s.website || null,
+              logo_url: s.logo_url || undefined,
+              counterparties: s.counterparties || undefined,
+            });
+          }
+        }
+      }
+    } catch {
+      // If recurring product isn't enabled or fails, just fall back to heuristics below
+      streamSubs = [];
+      streamBills = [];
+    }
+
+    // 3) Heuristic fallback from 12 months of txns
+    const heuristicSubsRaw = deriveSubscriptionsFromTxns(txns);
+
+    const subscriptionMerchantNames = new Set();
+    for (const s of streamSubs) subscriptionMerchantNames.add(lower(s.name));
+    for (const s of heuristicSubsRaw) subscriptionMerchantNames.add(lower(s.name));
+
+    const heuristicBillsRaw = deriveBillsFromTxns(txns, subscriptionMerchantNames);
+
+    // 4) Merge streams + heuristics (dedupe by merchant name, streams win)
+    const streamSubNames = new Set(streamSubs.map((s) => lower(s.name)));
+    const mergedSubs = [
+      ...streamSubs,
+      ...heuristicSubsRaw
+        .filter((s) => !streamSubNames.has(lower(s.name)))
+        .map((s) => ({
+          id: s.id,
+          name: s.name,
+          amount: s.amount,
+          cycle: s.cycle,
+          nextCharge: s.nextCharge,
+          isPaused: false,
+          alerts: false,
+          website: s.website || null,
+          counterparties: s.counterparties || undefined,
+        })),
+    ];
+
+    const streamBillNames = new Set(streamBills.map((b) => lower(b.name)));
+    const mergedBills = [
+      ...streamBills,
+      ...heuristicBillsRaw
+        .filter((b) => !streamBillNames.has(lower(b.name)))
+        .map((b) => ({
+          id: b.id,
+          name: b.name,
+          amount: b.amount,
+          dueDate: b.nextCharge,
+          autopay: false,
+          variable: false,
+          alerts: false,
+          website: b.website || null,
+          counterparties: b.counterparties || undefined,
+        })),
+    ];
 
     res.json({
       txns,
-      subscriptions: subs.map((s) => ({
-        id: s.id,
-        name: s.name,
-        amount: s.amount,
-        cycle: s.cycle,
-        nextCharge: s.nextCharge,
-        isPaused: false,
-        alerts: false,
-        website: s.website || null,
-        counterparties: s.counterparties || undefined,
-      })),
-      bills: bills.map((b) => ({
-        id: b.id,
-        name: b.name,
-        amount: b.amount,
-        dueDate: b.nextCharge,
-        autopay: false,
-        alerts: false,
-        website: b.website || null,
-        counterparties: b.counterparties || undefined,
-      })),
+      subscriptions: mergedSubs,
+      bills: mergedBills,
     });
   } catch (e) {
     return sendPlaidError(res, e);
