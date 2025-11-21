@@ -231,6 +231,7 @@ function normalizeTxn(t) {
     categoryId: pfcPrimary || "uncategorized",
     pfcPrimary,
     merchant: t.merchant_name || t.name || "Transaction",
+    normalizedName: normalizeMerchant(merchantName),
     type: expense ? "expense" : "income",
     website: t.website,
     counterparties: t.counterparties,
@@ -498,6 +499,7 @@ function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
   return {
     id,
     name,
+    normalizedName: norm,
     amount: Math.abs(Number(amount || 0)),
     cycle, // 'monthly' | 'annual'
     nextCharge:
@@ -506,6 +508,16 @@ function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
     counterparties: counterparties || undefined,
     alerts: false,
   };
+}
+
+function normalizeMerchant(name = "") {
+  return String(name)
+    .toLowerCase()
+    // strip non-alphanumeric
+    .replace(/[^a-z0-9]/g, " ")
+    // collapse spaces
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function groupByMerchantNormalized(txns) {
@@ -1161,6 +1173,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
         .map((s) => ({
           id: s.id,
           name: s.name,
+          normalizedName: s.normalizedName || normalizeMerchant(s.name),
           amount: s.amount,
           cycle: s.cycle,
           nextCharge: s.nextCharge,
@@ -1179,6 +1192,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
         .map((b) => ({
           id: b.id,
           name: b.name,
+          normalizedName: b.normalizedName || normalizeMerchant(b.name),
           amount: b.amount,
           dueDate: b.nextCharge,
           autopay: false,
