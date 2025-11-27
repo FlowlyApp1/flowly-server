@@ -220,6 +220,33 @@ app.post("/api/ai/chat", async (req, res) => {
 const TXN_CACHE = new Map(); // key: userId -> { ts: number, txns: NormalizedTxn[] }
 const CACHE_TTL_MS = 60_000;
 
+/* ============================================================================
+ * In-memory recurring overrides (per user, per merchant)
+ * ==========================================================================*/
+
+const RECURRING_OVERRIDE_TYPES = new Set(["subscription", "bill", "never"]);
+const RECURRING_OVERRIDES = new Map(); // key: `${userId}::${normalizedMerchant}` -> overrideType
+
+function makeOverrideKey(userId, normalizedMerchant) {
+  return `${String(userId)}::${normalizedMerchant}`;
+}
+
+function setRecurringOverride({ userId, merchantName, type }) {
+  const t = String(type || "").toLowerCase();
+  if (!RECURRING_OVERRIDE_TYPES.has(t)) return;
+  const norm = normalizeMerchant(merchantName || "");
+  if (!norm) return;
+  const key = makeOverrideKey(userId, norm);
+  RECURRING_OVERRIDES.set(key, t);
+}
+
+function getRecurringOverride(userId, merchantNameOrNormalized) {
+  const norm = normalizeMerchant(merchantNameOrNormalized || "");
+  if (!norm) return null;
+  const key = makeOverrideKey(userId, norm);
+  return RECURRING_OVERRIDES.get(key) || null;
+}
+
 function normalizeTxn(t) {
   const expense = t.amount > 0;
   const pfcPrimary =
@@ -396,6 +423,12 @@ const EXCLUDE_HINTS = [
   "sonic",
   "whataburger",
   "olive garden",
+  "cook out",
+  "cookout",
+  "steakhouse",
+  "burrito",
+  "taco ",
+  " tacos",
   "wing",
   "bbq",
   "bar & grill",
@@ -458,7 +491,9 @@ const EXCLUDE_HINTS = [
 
 // PFC categories to exclude unless on whitelist
 const EXCLUDE_PFC = [
+  "restaurant",
   "restaurants",
+  "dining",
   "fast food",
   "food and drink",
   "gas",
@@ -596,7 +631,7 @@ function isBillishPFC(pfc) {
   );
 }
 
-function deriveSubscriptionsFromTxns(txns) {
+function deriveSubscriptionsFromTxns(txns, userId = null) {
   const expenses = txns
     .filter((t) => t.type === "expense")
     .map((t) => ({ ...t, amount: Math.abs(t.amount) }));
@@ -613,6 +648,13 @@ function deriveSubscriptionsFromTxns(txns) {
     const span = dateSpanDays(dates);
     const nameLower = name.toLowerCase();
 
+    // User override (per merchant / per user)
+    const override = userId ? getRecurringOverride(userId, name) : null;
+    if (override === "never" || override === "bill") {
+      continue;
+    }
+    const overrideIsSub = override === "subscription";
+
     // Last charge recency filter (drop old stuff)
     const lastDate =
       dates.length > 0
@@ -625,13 +667,13 @@ function deriveSubscriptionsFromTxns(txns) {
     if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
 
     const topPFC = topCategoryPrimary(rows) || "";
-    const isKnownSub = merchantMatches(nameLower, SUB_BRANDS);
+    const isKnownSub = overrideIsSub || merchantMatches(nameLower, SUB_BRANDS);
     const isKnownBill = merchantMatches(nameLower, BILL_BRANDS);
     const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
 
     // Exclude food/gas/shopping/venmo/uber etc unless explicitly whitelisted as a subscription
-    if ((excludedByName || excludedByPFC) && !isKnownSub) continue;
+    if (!overrideIsSub && (excludedByName || excludedByPFC) && !isKnownSub) continue;
 
     const occ = rows.length;
     const cv = coefVar(amounts);
@@ -668,7 +710,7 @@ function deriveSubscriptionsFromTxns(txns) {
   return Array.from(uniq.values()).slice(0, 50);
 }
 
-function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
+function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId = null) {
   const expenses = txns
     .filter((t) => t.type === "expense")
     .map((t) => ({ ...t, amount: Math.abs(t.amount) }));
@@ -683,6 +725,13 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
 
     // Don't show something as a bill if we've already decided it's a subscription
     if (subscriptionMerchantNames.has(nameLower)) continue;
+
+    // User override (per merchant / per user)
+    const override = userId ? getRecurringOverride(userId, name) : null;
+    if (override === "never" || override === "subscription") {
+      continue;
+    }
+    const overrideIsBill = override === "bill";
 
     const dates = rows.map((r) => r.date);
     const span = dateSpanDays(dates);
@@ -702,7 +751,7 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
     if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
 
     const topPFC = topCategoryPrimary(rows) || "";
-    const isKnownBill = merchantMatches(nameLower, BILL_BRANDS);
+    const isKnownBill = overrideIsBill || merchantMatches(nameLower, BILL_BRANDS);
     const isKnownSub = merchantMatches(nameLower, SUB_BRANDS);
     const billishByCategory = isBillishPFC(topPFC);
 
@@ -710,7 +759,7 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set()) {
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
 
     // Exclude food/gas/shopping/venmo/uber, etc., unless explicitly whitelisted as a bill
-    if ((excludedByName || excludedByPFC) && !isKnownBill) continue;
+    if (!overrideIsBill && (excludedByName || excludedByPFC) && !isKnownBill) continue;
 
     const occ = rows.length;
     const cv = coefVar(amounts);
@@ -779,13 +828,19 @@ function freqToInfo(freq) {
  *    heuristic engine, so streams behave more like budget_snapshot.
  *  - Returns "subscription", "bill", or null to drop.
  */
-function classifyStream(s) {
-  const name = (s.merchant_name || s.description || "").toLowerCase();
+function classifyStream(s, userId = null) {
+  const rawName = s.merchant_name || s.description || "";
+  const name = rawName.toLowerCase();
   const pfcPrimary = s.personal_finance_category?.primary?.toLowerCase?.() || "";
   const categories = (Array.isArray(s.category) ? s.category : []).map((c) =>
     String(c).toLowerCase()
   );
   const freq = String(s.frequency || "").toUpperCase();
+
+  // User override first
+  const override = userId ? getRecurringOverride(userId, rawName) : null;
+  if (override === "never") return null;
+  if (override === "subscription" || override === "bill") return override;
 
   const monthlyish = [
     "WEEKLY",
@@ -1107,7 +1162,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
         const now = new Date();
 
         for (const s of streams) {
-          const kind = classifyStream(s);
+          const kind = classifyStream(s, userId);
           if (!kind) continue;
 
           const lastDate = s.last_date || s.first_date || null;
@@ -1160,13 +1215,17 @@ app.get("/api/budget_snapshot", async (req, res) => {
     }
 
     // 3) Heuristic fallback from 12 months of txns
-    const heuristicSubsRaw = deriveSubscriptionsFromTxns(txns);
+    const heuristicSubsRaw = deriveSubscriptionsFromTxns(txns, userId);
 
     const subscriptionMerchantNames = new Set();
     for (const s of streamSubs) subscriptionMerchantNames.add(lower(s.name));
     for (const s of heuristicSubsRaw) subscriptionMerchantNames.add(lower(s.name));
 
-    const heuristicBillsRaw = deriveBillsFromTxns(txns, subscriptionMerchantNames);
+    const heuristicBillsRaw = deriveBillsFromTxns(
+      txns,
+      subscriptionMerchantNames,
+      userId
+    );
 
     // 4) Merge streams + heuristics (dedupe by merchant name, streams win)
     const streamSubNames = new Set(streamSubs.map((s) => lower(s.name)));
@@ -1217,6 +1276,28 @@ app.get("/api/budget_snapshot", async (req, res) => {
   }
 });
 
+/* ===== Recurring override API (from UI actions) ===== */
+app.post("/api/recurring/override", async (req, res) => {
+  try {
+    const { userId: rawUserId, merchantName, type } = req.body || {};
+    const userId = String(rawUserId || "demo-user");
+
+    if (!merchantName || !type) {
+      return res.status(400).json({ error: "missing_fields" });
+    }
+
+    const t = String(type || "").toLowerCase();
+    if (!RECURRING_OVERRIDE_TYPES.has(t)) {
+      return res.status(400).json({ error: "invalid_type" });
+    }
+
+    setRecurringOverride({ userId, merchantName, type: t });
+    return res.json({ ok: true });
+  } catch (e) {
+    return sendError(res, e);
+  }
+});
+
 /* ===== Subscriptions & Bills via Plaid Recurring Streams (with fallback) ===== */
 app.get("/api/subscriptions", async (req, res) => {
   try {
@@ -1240,7 +1321,7 @@ app.get("/api/subscriptions", async (req, res) => {
       const now = new Date();
 
       for (const s of streams) {
-        const kind = classifyStream(s);
+        const kind = classifyStream(s, userId);
         if (kind !== "subscription") continue;
 
         const lastDate = s.last_date || s.first_date || null;
@@ -1279,7 +1360,7 @@ app.get("/api/subscriptions", async (req, res) => {
       userId,
       access_token: user.access_token,
     });
-    const subs = deriveSubscriptionsFromTxns(txns);
+    const subs = deriveSubscriptionsFromTxns(txns, userId);
     return res.json({ subscriptions: subs });
   } catch (e) {
     return sendPlaidError(res, e);
@@ -1308,7 +1389,7 @@ app.get("/api/bills", async (req, res) => {
       const now = new Date();
 
       for (const s of streams) {
-        const kind = classifyStream(s);
+        const kind = classifyStream(s, userId);
         if (kind !== "bill") continue;
 
         const lastDate = s.last_date || s.first_date || null;
@@ -1347,11 +1428,11 @@ app.get("/api/bills", async (req, res) => {
       userId,
       access_token: user.access_token,
     });
-    const subsFallback = deriveSubscriptionsFromTxns(txns);
+    const subsFallback = deriveSubscriptionsFromTxns(txns, userId);
     const subMerchantNames = new Set(
       subsFallback.map((s) => (s.name || "").toLowerCase().trim())
     );
-    const bills = deriveBillsFromTxns(txns, subMerchantNames).map((b) => ({
+    const bills = deriveBillsFromTxns(txns, subMerchantNames, userId).map((b) => ({
       id: b.id,
       name: b.name,
       amount: b.amount,
@@ -1381,18 +1462,18 @@ app.get("/api/debug/recurring", async (req, res) => {
       getAllTransactionsOnce({ userId, access_token: user.access_token }),
     ]);
 
-    const subsFallback = deriveSubscriptionsFromTxns(txns);
+    const subsFallback = deriveSubscriptionsFromTxns(txns, userId);
     const subMerchantNames = new Set(
       subsFallback.map((s) => (s.name || "").toLowerCase().trim())
     );
-    const billsFallback = deriveBillsFromTxns(txns, subMerchantNames);
+    const billsFallback = deriveBillsFromTxns(txns, subMerchantNames, userId);
 
     const subsStreams = [];
     const billsStreams = [];
     const now = new Date();
 
     for (const s of streams) {
-      const kind = classifyStream(s);
+      const kind = classifyStream(s, userId);
       const lastDate = s.last_date || s.first_date || null;
       const recentEnough =
         !lastDate || daysBetween(lastDate, now) <= RECENT_DAYS_CUTOFF;
