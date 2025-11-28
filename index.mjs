@@ -598,6 +598,16 @@ function normalizeMerchant(name = "") {
     .trim();
 }
 
+// Helper: for dedupe / grouping
+function normalizedDisplayKey(name = "", normalizedName) {
+  let base = normalizedName || normalizeMerchant(name);
+  // Strip very generic suffixes that often cause dupe-like names
+  if (base.endsWith(" com")) base = base.slice(0, -4).trim();
+  if (base.endsWith(" inc")) base = base.slice(0, -4).trim();
+  if (base.endsWith(" llc")) base = base.slice(0, -4).trim();
+  return base || (name || "").toLowerCase().trim();
+}
+
 function groupByMerchantNormalized(txns) {
   const map = new Map();
   for (const t of txns) {
@@ -629,6 +639,21 @@ function topCategoryPrimary(rows) {
     }
   }
   return top;
+}
+
+// Stronger: is this merchant mostly in excluded PFC categories?
+function isMostlyExcludedCategory(rows) {
+  let total = 0;
+  let excluded = 0;
+  for (const r of rows) {
+    const c = (r.pfcPrimary || r.categoryId || "").toLowerCase();
+    if (!c) continue;
+    total += 1;
+    if (EXCLUDE_PFC.some((p) => c.includes(p))) {
+      excluded += 1;
+    }
+  }
+  return total > 0 && excluded / total >= 0.6;
 }
 
 function coefVar(nums) {
@@ -668,6 +693,59 @@ function isBillishPFC(pfc) {
     p.includes("tuition") ||
     p.includes("education")
   );
+}
+
+// Generic dedupe helper: one item per normalized merchant, preferring streams/“richer” entries
+function dedupeByMerchantName(items) {
+  const byKey = new Map();
+  for (const item of items) {
+    const key = normalizedDisplayKey(item.name, item.normalizedName);
+    const existing = byKey.get(key);
+
+    if (!existing) {
+      byKey.set(key, item);
+      continue;
+    }
+
+    const existingFromFallback =
+      typeof existing.id === "string" &&
+      (existing.id.startsWith("sub:") || existing.id.startsWith("bill:"));
+    const currentFromFallback =
+      typeof item.id === "string" &&
+      (item.id.startsWith("sub:") || item.id.startsWith("bill:"));
+
+    const existingHasLogo = !!existing.logo_url;
+    const currentHasLogo = !!item.logo_url;
+
+    const existingDate = existing.nextCharge || existing.dueDate || null;
+    const currentDate = item.nextCharge || item.dueDate || null;
+
+    let replace = false;
+
+    // Prefer streams (non "sub:" / "bill:" ids) over fallback
+    if (existingFromFallback && !currentFromFallback) {
+      replace = true;
+    } else if (!existingFromFallback && currentFromFallback) {
+      replace = false;
+    } else {
+      // Prefer one with logo
+      if (!existingHasLogo && currentHasLogo) {
+        replace = true;
+      } else if (existingHasLogo && !currentHasLogo) {
+        replace = false;
+      } else if (existingDate && currentDate) {
+        // Prefer more recent
+        if (new Date(currentDate) > new Date(existingDate)) {
+          replace = true;
+        }
+      }
+    }
+
+    if (replace) {
+      byKey.set(key, item);
+    }
+  }
+  return Array.from(byKey.values());
 }
 
 function deriveSubscriptionsFromTxns(txns, userId = null) {
@@ -710,21 +788,28 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
     const isKnownBill = merchantMatches(nameLower, BILL_BRANDS);
     const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
+    const mostlyExcluded = isMostlyExcludedCategory(rows);
 
     // Exclude food/gas/shopping/venmo/uber etc unless explicitly whitelisted as a subscription
-    if (!overrideIsSub && (excludedByName || excludedByPFC) && !isKnownSub) continue;
+    if (
+      !overrideIsSub &&
+      (excludedByName || excludedByPFC || mostlyExcluded) &&
+      !isKnownSub
+    )
+      continue;
 
     const occ = rows.length;
     const cv = coefVar(amounts);
 
-    // Known subs: be more lenient, just require at least 1 recent charge
+    // Known subs: still a bit lenient but favor fixed-ish prices
     const passesKnown = isKnownSub && occ >= 1;
 
     const gapsMonthly = monthlyGaps(dates);
     const passesUnknown =
       !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
 
-    const stable = isKnownSub ? cv <= 0.6 : cv <= 0.3;
+    // Subscriptions should be “mostly fixed”
+    const stable = isKnownSub ? cv <= 0.4 : cv <= 0.2;
 
     if ((passesKnown || passesUnknown) && stable) {
       const latest = rows.sort(
@@ -796,9 +881,15 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
 
     const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
+    const mostlyExcluded = isMostlyExcludedCategory(rows);
 
     // Exclude food/gas/shopping/venmo/uber, etc., unless explicitly whitelisted as a bill
-    if (!overrideIsBill && (excludedByName || excludedByPFC) && !isKnownBill) continue;
+    if (
+      !overrideIsBill &&
+      (excludedByName || excludedByPFC || mostlyExcluded) &&
+      !isKnownBill
+    )
+      continue;
 
     const occ = rows.length;
     const cv = coefVar(amounts);
@@ -813,7 +904,8 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
       passes = occ >= 3 && span >= 60 && gapsMonthly >= 1;
     }
 
-    const stable = cv <= 0.7;
+    // Bills can fluctuate more than subs, but not be completely random
+    const stable = cv <= 1.0;
 
     if (passes && stable) {
       const latest = rows.sort(
@@ -955,8 +1047,8 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
  * ==========================================================================*/
 
 const RECURRING_RESULT_TTL = 2 * 60 * 1000; // 2 minutes
-const SUBS_RESULT_CACHE = new Map(); // userId -> { ts, subs }
-const BILLS_RESULT_CACHE = new Map(); // userId -> { ts, bills }
+const SUBS_RESULT_CACHE = new Map(); // userId -> { ts, data }
+const BILLS_RESULT_CACHE = new Map(); // userId -> { ts, data }
 
 function getCachedRecurringResult(cache, userId) {
   const hit = cache.get(userId);
@@ -988,7 +1080,7 @@ app.post("/api/create_link_token", async (req, res) => {
       });
     }
 
-    const payload = {
+    const payload: any = {
       user: { client_user_id },
       client_name: "Flowly",
       products: PRODUCTS,
@@ -1008,7 +1100,6 @@ app.post("/api/create_link_token", async (req, res) => {
     for (const k of Object.keys(payload)) {
       const v = payload[k];
       if (v === "" || v == null || (Array.isArray(v) && v.length === 0)) {
-        // @ts-ignore
         delete payload[k];
       }
     }
@@ -1017,7 +1108,7 @@ app.post("/api/create_link_token", async (req, res) => {
 
     const resp = await plaid.linkTokenCreate(payload);
     return res.json({ link_token: resp.data.link_token, platform: "ios" });
-  } catch (e) {
+  } catch (e: any) {
     const code = e?.response?.data?.error_code;
 
     if (code === "INVALID_FIELD") {
@@ -1142,7 +1233,7 @@ app.get("/api/accounts", async (req, res) => {
     }));
 
     res.json({ accounts });
-  } catch (e) {
+  } catch (e: any) {
     const code = e?.response?.data?.error_code || e?.error_code;
     if (code === "PRODUCT_NOT_READY") {
       return res.status(202).json({ pending: true });
@@ -1170,6 +1261,7 @@ app.post("/api/plaid/webhook", async (req, res) => {
         STREAMS_CACHE.delete(userId);
         SUBS_RESULT_CACHE.delete(userId);
         BILLS_RESULT_CACHE.delete(userId);
+        TXN_CACHE.delete(userId);
       }
     }
     if (
@@ -1181,6 +1273,7 @@ app.post("/api/plaid/webhook", async (req, res) => {
         STREAMS_CACHE.delete(userId);
         SUBS_RESULT_CACHE.delete(userId);
         BILLS_RESULT_CACHE.delete(userId);
+        TXN_CACHE.delete(userId);
       }
     }
     res.json({ ok: true });
@@ -1204,11 +1297,11 @@ app.get("/api/budget_snapshot", async (req, res) => {
       access_token: user.access_token,
     });
 
-    const lower = (s) => (s || "").toLowerCase().trim();
+    const lower = (s: string) => (s || "").toLowerCase().trim();
 
     // 2) Try recurring streams once (subscriptions + bills)
-    let streamSubs = [];
-    let streamBills = [];
+    let streamSubs: any[] = [];
+    let streamBills: any[] = [];
     try {
       const streams = await getRecurringStreamsOnce({
         userId,
@@ -1239,6 +1332,9 @@ app.get("/api/budget_snapshot", async (req, res) => {
             streamSubs.push({
               id: s.stream_id,
               name: s.merchant_name || s.description || "Subscription",
+              normalizedName: normalizeMerchant(
+                s.merchant_name || s.description || "Subscription"
+              ),
               amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
               cycle: cycle === "annual" ? "annual" : "monthly",
               nextCharge: next,
@@ -1252,6 +1348,9 @@ app.get("/api/budget_snapshot", async (req, res) => {
             streamBills.push({
               id: s.stream_id,
               name: s.merchant_name || s.description || "Bill",
+              normalizedName: normalizeMerchant(
+                s.merchant_name || s.description || "Bill"
+              ),
               amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
               dueDate: next,
               autopay: false,
@@ -1272,7 +1371,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
     // 3) Heuristic fallback from 12 months of txns
     const heuristicSubsRaw = deriveSubscriptionsFromTxns(txns, userId);
 
-    const subscriptionMerchantNames = new Set();
+    const subscriptionMerchantNames = new Set<string>();
     for (const s of streamSubs) subscriptionMerchantNames.add(lower(s.name));
     for (const s of heuristicSubsRaw) subscriptionMerchantNames.add(lower(s.name));
 
@@ -1282,9 +1381,9 @@ app.get("/api/budget_snapshot", async (req, res) => {
       userId
     );
 
-    // 4) Merge streams + heuristics (dedupe by merchant name, streams win)
+    // 4) Merge streams + heuristics (dedupe by merchant-ish name, streams win)
     const streamSubNames = new Set(streamSubs.map((s) => lower(s.name)));
-    const mergedSubs = [
+    const mergedSubsPreDedupe = [
       ...streamSubs,
       ...heuristicSubsRaw
         .filter((s) => !streamSubNames.has(lower(s.name)))
@@ -1301,9 +1400,10 @@ app.get("/api/budget_snapshot", async (req, res) => {
           counterparties: s.counterparties || undefined,
         })),
     ];
+    const mergedSubs = dedupeByMerchantName(mergedSubsPreDedupe);
 
     const streamBillNames = new Set(streamBills.map((b) => lower(b.name)));
-    const mergedBills = [
+    const mergedBillsPreDedupe = [
       ...streamBills,
       ...heuristicBillsRaw
         .filter((b) => !streamBillNames.has(lower(b.name)))
@@ -1320,6 +1420,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
           counterparties: b.counterparties || undefined,
         })),
     ];
+    const mergedBills = dedupeByMerchantName(mergedBillsPreDedupe);
 
     res.json({
       txns,
@@ -1370,7 +1471,10 @@ app.post("/api/override/move_to_bills", (req, res) => {
   if (!merchantName) {
     return res
       .status(400)
-      .json({ error: "missing_merchantName", hint: "Send merchantName/name/merchant/normalizedName" });
+      .json({
+        error: "missing_merchantName",
+        hint: "Send merchantName/name/merchant/normalizedName",
+      });
   }
   setRecurringOverride({ userId, merchantName, type: "bill" });
   STREAMS_CACHE.delete(userId);
@@ -1386,7 +1490,10 @@ app.post("/api/override/move_to_subscriptions", (req, res) => {
   if (!merchantName) {
     return res
       .status(400)
-      .json({ error: "missing_merchantName", hint: "Send merchantName/name/merchant/normalizedName" });
+      .json({
+        error: "missing_merchantName",
+        hint: "Send merchantName/name/merchant/normalizedName",
+      });
   }
   setRecurringOverride({ userId, merchantName, type: "subscription" });
   STREAMS_CACHE.delete(userId);
@@ -1402,7 +1509,10 @@ app.post("/api/override/remove_from_subscriptions", (req, res) => {
   if (!merchantName) {
     return res
       .status(400)
-      .json({ error: "missing_merchantName", hint: "Send merchantName/name/merchant/normalizedName" });
+      .json({
+        error: "missing_merchantName",
+        hint: "Send merchantName/name/merchant/normalizedName",
+      });
   }
   setRecurringOverride({ userId, merchantName, type: "never" });
   STREAMS_CACHE.delete(userId);
@@ -1425,18 +1535,18 @@ app.get("/api/subscriptions", async (req, res) => {
     if (!user?.access_token)
       return res.status(400).json({ error: "no_linked_item" });
 
-    let streams = [];
+    let streams: any[] = [];
     try {
       streams = await getRecurringStreamsOnce({
         userId,
         access_token: user.access_token,
       });
-    } catch (e) {
+    } catch {
       streams = [];
     }
 
     if (streams.length > 0) {
-      const subs = [];
+      const subs: any[] = [];
       const now = new Date();
 
       for (const s of streams) {
@@ -1460,6 +1570,9 @@ app.get("/api/subscriptions", async (req, res) => {
         subs.push({
           id: s.stream_id,
           name: s.merchant_name || s.description || "Subscription",
+          normalizedName: normalizeMerchant(
+            s.merchant_name || s.description || "Subscription"
+          ),
           amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
           cycle: cycle === "annual" ? "annual" : "monthly",
           nextCharge: next,
@@ -1471,8 +1584,9 @@ app.get("/api/subscriptions", async (req, res) => {
         });
       }
 
-      setCachedRecurringResult(SUBS_RESULT_CACHE, userId, subs);
-      return res.json({ subscriptions: subs });
+      const deduped = dedupeByMerchantName(subs);
+      setCachedRecurringResult(SUBS_RESULT_CACHE, userId, deduped);
+      return res.json({ subscriptions: deduped });
     }
 
     // Fallback
@@ -1480,7 +1594,21 @@ app.get("/api/subscriptions", async (req, res) => {
       userId,
       access_token: user.access_token,
     });
-    const subs = deriveSubscriptionsFromTxns(txns, userId);
+    const subsRaw = deriveSubscriptionsFromTxns(txns, userId);
+    const subs = dedupeByMerchantName(
+      subsRaw.map((s) => ({
+        id: s.id,
+        name: s.name,
+        normalizedName: s.normalizedName || normalizeMerchant(s.name),
+        amount: s.amount,
+        cycle: s.cycle,
+        nextCharge: s.nextCharge,
+        isPaused: false,
+        alerts: false,
+        website: s.website || null,
+        counterparties: s.counterparties || undefined,
+      }))
+    );
     setCachedRecurringResult(SUBS_RESULT_CACHE, userId, subs);
     return res.json({ subscriptions: subs });
   } catch (e) {
@@ -1499,18 +1627,18 @@ app.get("/api/bills", async (req, res) => {
     if (!user?.access_token)
       return res.status(400).json({ error: "no_linked_item" });
 
-    let streams = [];
+    let streams: any[] = [];
     try {
       streams = await getRecurringStreamsOnce({
         userId,
         access_token: user.access_token,
       });
-    } catch (e) {
+    } catch {
       streams = [];
     }
 
     if (streams.length > 0) {
-      const bills = [];
+      const bills: any[] = [];
       const now = new Date();
 
       for (const s of streams) {
@@ -1534,6 +1662,9 @@ app.get("/api/bills", async (req, res) => {
         bills.push({
           id: s.stream_id,
           name: s.merchant_name || s.description || "Bill",
+          normalizedName: normalizeMerchant(
+            s.merchant_name || s.description || "Bill"
+          ),
           amount: toDollars(s.last_amount ?? s.average_amount ?? 0),
           dueDate: next,
           autopay: false,
@@ -1545,8 +1676,9 @@ app.get("/api/bills", async (req, res) => {
         });
       }
 
-      setCachedRecurringResult(BILLS_RESULT_CACHE, userId, bills);
-      return res.json({ bills });
+      const deduped = dedupeByMerchantName(bills);
+      setCachedRecurringResult(BILLS_RESULT_CACHE, userId, deduped);
+      return res.json({ bills: deduped });
     }
 
     // Fallback — use subs to avoid duplicates
@@ -1558,17 +1690,21 @@ app.get("/api/bills", async (req, res) => {
     const subMerchantNames = new Set(
       subsFallback.map((s) => (s.name || "").toLowerCase().trim())
     );
-    const bills = deriveBillsFromTxns(txns, subMerchantNames, userId).map((b) => ({
-      id: b.id,
-      name: b.name,
-      amount: b.amount,
-      dueDate: b.nextCharge,
-      autopay: false,
-      variable: false,
-      alerts: false,
-      website: b.website || null,
-      counterparties: b.counterparties || undefined,
-    }));
+    const billsRaw = deriveBillsFromTxns(txns, subMerchantNames, userId);
+    const bills = dedupeByMerchantName(
+      billsRaw.map((b) => ({
+        id: b.id,
+        name: b.name,
+        normalizedName: b.normalizedName || normalizeMerchant(b.name),
+        amount: b.amount,
+        dueDate: b.nextCharge,
+        autopay: false,
+        variable: false,
+        alerts: false,
+        website: b.website || null,
+        counterparties: b.counterparties || undefined,
+      }))
+    );
 
     setCachedRecurringResult(BILLS_RESULT_CACHE, userId, bills);
     return res.json({ bills });
@@ -1596,8 +1732,8 @@ app.get("/api/debug/recurring", async (req, res) => {
     );
     const billsFallback = deriveBillsFromTxns(txns, subMerchantNames, userId);
 
-    const subsStreams = [];
-    const billsStreams = [];
+    const subsStreams: any[] = [];
+    const billsStreams: any[] = [];
     const now = new Date();
 
     for (const s of streams) {
@@ -1651,3 +1787,4 @@ app.get("/api/debug/recurring", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Flowly server running on http://localhost:${PORT}`);
 });
+   
