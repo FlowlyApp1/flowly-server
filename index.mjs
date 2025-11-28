@@ -1080,7 +1080,7 @@ app.post("/api/create_link_token", async (req, res) => {
       });
     }
 
-    const payload: any = {
+    const payload = {
       user: { client_user_id },
       client_name: "Flowly",
       products: PRODUCTS,
