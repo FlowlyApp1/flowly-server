@@ -1298,6 +1298,67 @@ app.post("/api/recurring/override", async (req, res) => {
   }
 });
 
+/* ===== Legacy-style override endpoints used by Budget UI (Option A wiring) ===== */
+app.post("/api/override/move_to_bills", async (req, res) => {
+  try {
+    const { userId: rawUserId, merchantName } = req.body || {};
+    const userId = String(rawUserId || "demo-user");
+    if (!merchantName) {
+      return res.status(400).json({ error: "missing_merchantName" });
+    }
+
+    setRecurringOverride({ userId, merchantName, type: "bill" });
+    return res.json({ ok: true });
+  } catch (e) {
+    return sendError(res, e);
+  }
+});
+
+app.post("/api/override/move_to_subscriptions", async (req, res) => {
+  try {
+    const { userId: rawUserId, merchantName } = req.body || {};
+    const userId = String(rawUserId || "demo-user");
+    if (!merchantName) {
+      return res.status(400).json({ error: "missing_merchantName" });
+    }
+
+    setRecurringOverride({ userId, merchantName, type: "subscription" });
+    return res.json({ ok: true });
+  } catch (e) {
+    return sendError(res, e);
+  }
+});
+
+app.post("/api/override/remove_from_bills", async (req, res) => {
+  try {
+    const { userId: rawUserId, merchantName } = req.body || {};
+    const userId = String(rawUserId || "demo-user");
+    if (!merchantName) {
+      return res.status(400).json({ error: "missing_merchantName" });
+    }
+
+    setRecurringOverride({ userId, merchantName, type: "never" });
+    return res.json({ ok: true });
+  } catch (e) {
+    return sendError(res, e);
+  }
+});
+
+app.post("/api/override/remove_from_subscriptions", async (req, res) => {
+  try {
+    const { userId: rawUserId, merchantName } = req.body || {};
+    const userId = String(rawUserId || "demo-user");
+    if (!merchantName) {
+      return res.status(400).json({ error: "missing_merchantName" });
+    }
+
+    setRecurringOverride({ userId, merchantName, type: "never" });
+    return res.json({ ok: true });
+  } catch (e) {
+    return sendError(res, e);
+  }
+});
+
 /* ===== Subscriptions & Bills via Plaid Recurring Streams (with fallback) ===== */
 app.get("/api/subscriptions", async (req, res) => {
   try {
