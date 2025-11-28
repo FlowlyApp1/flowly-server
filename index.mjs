@@ -250,13 +250,42 @@ function getRecurringOverride(userId, merchantNameOrNormalized) {
 // NEW: helper to accept multiple field names from the client
 function extractMerchantName(body) {
   if (!body) return null;
-  return (
+
+  // 1) Preferred explicit fields
+  const direct =
     body.merchantName ||
     body.name ||
     body.merchant ||
-    body.normalizedName ||
-    null
-  );
+    body.normalizedName;
+
+  if (direct && typeof direct === "string" && direct.trim()) {
+    return direct.trim();
+  }
+
+  // 2) Fallback: pick the first reasonable-looking string field
+  const blacklist = new Set([
+    "userId",
+    "type",
+    "id",
+    "streamId",
+    "transactionId",
+    "amount",
+    "nextCharge",
+    "dueDate",
+  ]);
+
+  for (const [key, value] of Object.entries(body)) {
+    if (blacklist.has(key)) continue;
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    // simple sanity: must contain at least one letter
+    if (!/[a-zA-Z]/.test(trimmed)) continue;
+
+    return trimmed;
+  }
+
+  return null;
 }
 
 function normalizeTxn(t) {
