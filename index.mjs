@@ -1108,7 +1108,7 @@ app.post("/api/create_link_token", async (req, res) => {
 
     const resp = await plaid.linkTokenCreate(payload);
     return res.json({ link_token: resp.data.link_token, platform: "ios" });
-  } catch (e: any) {
+  } catch (e) {
     const code = e?.response?.data?.error_code;
 
     if (code === "INVALID_FIELD") {
@@ -1300,8 +1300,8 @@ app.get("/api/budget_snapshot", async (req, res) => {
     const lower = (s) => (s || "").toLowerCase().trim();
 
     // 2) Try recurring streams once (subscriptions + bills)
-    let streamSubs: any[] = [];
-    let streamBills: any[] = [];
+    let streamSubs = [];
+    let streamBills = [];
     try {
       const streams = await getRecurringStreamsOnce({
         userId,
@@ -1535,7 +1535,7 @@ app.get("/api/subscriptions", async (req, res) => {
     if (!user?.access_token)
       return res.status(400).json({ error: "no_linked_item" });
 
-    let streams: any[] = [];
+    let streams = [];
     try {
       streams = await getRecurringStreamsOnce({
         userId,
@@ -1546,7 +1546,7 @@ app.get("/api/subscriptions", async (req, res) => {
     }
 
     if (streams.length > 0) {
-      const subs: any[] = [];
+      const subs = [];
       const now = new Date();
 
       for (const s of streams) {
@@ -1627,7 +1627,7 @@ app.get("/api/bills", async (req, res) => {
     if (!user?.access_token)
       return res.status(400).json({ error: "no_linked_item" });
 
-    let streams: any[] = [];
+    let streams = [];
     try {
       streams = await getRecurringStreamsOnce({
         userId,
@@ -1638,7 +1638,7 @@ app.get("/api/bills", async (req, res) => {
     }
 
     if (streams.length > 0) {
-      const bills: any[] = [];
+      const bills = [];
       const now = new Date();
 
       for (const s of streams) {
@@ -1732,8 +1732,8 @@ app.get("/api/debug/recurring", async (req, res) => {
     );
     const billsFallback = deriveBillsFromTxns(txns, subMerchantNames, userId);
 
-    const subsStreams: any[] = [];
-    const billsStreams: any[] = [];
+    const subsStreams = [];
+    const billsStreams = [];
     const now = new Date();
 
     for (const s of streams) {
