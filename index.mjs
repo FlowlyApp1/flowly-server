@@ -1297,7 +1297,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
       access_token: user.access_token,
     });
 
-    const lower = (s: string) => (s || "").toLowerCase().trim();
+    const lower = (s) => (s || "").toLowerCase().trim();
 
     // 2) Try recurring streams once (subscriptions + bills)
     let streamSubs: any[] = [];
