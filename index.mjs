@@ -99,8 +99,8 @@ const plaidConfig = new Configuration({
     headers: {
       "PLAID-CLIENT-ID": process.env.PLAID_CLIENT_ID || "",
       "PLAID-SECRET": process.env.PLAID_SECRET || "",
+      timeout: 20000,
     },
-    timeout: 20000,
   },
 });
 const plaid = new PlaidApi(plaidConfig);
@@ -216,7 +216,7 @@ app.post("/api/ai/chat", async (req, res) => {
  * ONE-PULL CORE (cache + single normalized fetch)
  * ==========================================================================*/
 
-// 60s in-memory cache
+// 60s in-memory cache for normalized transactions
 const TXN_CACHE = new Map(); // key: userId -> { ts: number, txns: NormalizedTxn[] }
 const CACHE_TTL_MS = 60_000;
 
@@ -245,6 +245,18 @@ function getRecurringOverride(userId, merchantNameOrNormalized) {
   if (!norm) return null;
   const key = makeOverrideKey(userId, norm);
   return RECURRING_OVERRIDES.get(key) || null;
+}
+
+// NEW: helper to accept multiple field names from the client
+function extractMerchantName(body) {
+  if (!body) return null;
+  return (
+    body.merchantName ||
+    body.name ||
+    body.merchant ||
+    body.normalizedName ||
+    null
+  );
 }
 
 function normalizeTxn(t) {
@@ -404,7 +416,7 @@ const BILL_BRANDS = [
 
 // Obvious one-off retail/food/gas/grocery/transport/P2P to exclude unless whitelisted
 const EXCLUDE_HINTS = [
-  // Fast food / chains (some already existed)
+  // Fast food / chains
   "mcdonald",
   "burger king",
   "wendy's",
@@ -552,9 +564,7 @@ function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
 function normalizeMerchant(name = "") {
   return String(name)
     .toLowerCase()
-    // strip non-alphanumeric
     .replace(/[^a-z0-9]/g, " ")
-    // collapse spaces
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -767,19 +777,13 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
     let passes = false;
 
     if (isKnownBill) {
-      // Known bill brands (utilities, insurance, etc.) – allow even if new,
-      // but still want at least 1 occurrence
       passes = occ >= 1 && span >= 0;
     } else if (billishByCategory && !isKnownSub) {
-      // Category looks like a bill (utilities, loans, rent, etc.)
-      // Can be new, but should appear at least twice (e.g. first two months)
       passes = occ >= 2 && span >= 25;
     } else if (!isKnownSub) {
-      // Generic recurring stuff – very strict
       passes = occ >= 3 && span >= 60 && gapsMonthly >= 1;
     }
 
-    // Bills can be a bit more variable
     const stable = cv <= 0.7;
 
     if (passes && stable) {
@@ -862,18 +866,14 @@ function classifyStream(s, userId = null) {
       categories.some((cat) => cat.includes(c))
   );
 
-  // If this looks like obvious food/gas/shopping/venmo/uber/etc AND is not on
-  // a whitelist, drop it up front.
   if ((excludedByName || excludedByPFC) && !isKnownSub && !isKnownBill) {
     return null;
   }
 
-  // Bill-ish by PFC or categories
   const billishByCategory =
     isBillishPFC(pfcPrimary) ||
     categories.some((cat) => isBillishPFC(cat));
 
-  // Subscription-ish PFC/categories
   const pfcLooksSubscription =
     pfcPrimary.includes("subscription") ||
     pfcPrimary.includes("entertainment") ||
@@ -881,16 +881,13 @@ function classifyStream(s, userId = null) {
       (c) => c.includes("subscription") || c.includes("entertainment")
     );
 
-  // Strong signals
   if (isKnownBill && !isKnownSub) return "bill";
   if (isKnownSub && !isKnownBill) return "subscription";
 
-  // If it's not at least roughly monthly, and not whitelisted, ignore.
   if (!monthlyish && !isKnownSub && !isKnownBill) {
     return null;
   }
 
-  // Category-driven classification
   const looksBill =
     billishByCategory ||
     isKnownBill ||
@@ -909,7 +906,6 @@ function classifyStream(s, userId = null) {
   if (looksBill && !looksSubscription) return "bill";
   if (looksSubscription && !looksBill) return "subscription";
 
-  // If we couldn't confidently classify, drop it instead of guessing.
   return null;
 }
 
@@ -923,6 +919,28 @@ async function getRecurringStreamsOnce({ userId, access_token }) {
   const streams = r.data?.streams || [];
   STREAMS_CACHE.set(userId, { ts: Date.now(), streams });
   return streams;
+}
+
+/* ============================================================================
+ * Result caches for subscriptions/bills endpoints
+ * ==========================================================================*/
+
+const RECURRING_RESULT_TTL = 2 * 60 * 1000; // 2 minutes
+const SUBS_RESULT_CACHE = new Map(); // userId -> { ts, subs }
+const BILLS_RESULT_CACHE = new Map(); // userId -> { ts, bills }
+
+function getCachedRecurringResult(cache, userId) {
+  const hit = cache.get(userId);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > RECURRING_RESULT_TTL) {
+    cache.delete(userId);
+    return null;
+  }
+  return hit.data;
+}
+
+function setCachedRecurringResult(cache, userId, data) {
+  cache.set(userId, { ts: Date.now(), data });
 }
 
 /* ============================================================================
@@ -961,6 +979,7 @@ app.post("/api/create_link_token", async (req, res) => {
     for (const k of Object.keys(payload)) {
       const v = payload[k];
       if (v === "" || v == null || (Array.isArray(v) && v.length === 0)) {
+        // @ts-ignore
         delete payload[k];
       }
     }
@@ -973,7 +992,7 @@ app.post("/api/create_link_token", async (req, res) => {
     const code = e?.response?.data?.error_code;
 
     if (code === "INVALID_FIELD") {
-      // Retry without any optional extras (we already removed them, but keep a minimal retry)
+      // Retry minimal
       try {
         const client_user_id = String(req.body?.userId || "demo-user");
         const fallback = await plaid.linkTokenCreate({
@@ -1118,14 +1137,22 @@ app.post("/api/plaid/webhook", async (req, res) => {
         "user",
         userId
       );
-      if (userId) STREAMS_CACHE.delete(userId); // bust streams cache on sync updates too
+      if (userId) {
+        STREAMS_CACHE.delete(userId);
+        SUBS_RESULT_CACHE.delete(userId);
+        BILLS_RESULT_CACHE.delete(userId);
+      }
     }
     if (
       webhook_type === "TRANSACTIONS" &&
       webhook_code === "RECURRING_TRANSACTIONS_UPDATE"
     ) {
       const userId = await getUserIdByItemId(item_id);
-      if (userId) STREAMS_CACHE.delete(userId);
+      if (userId) {
+        STREAMS_CACHE.delete(userId);
+        SUBS_RESULT_CACHE.delete(userId);
+        BILLS_RESULT_CACHE.delete(userId);
+      }
     }
     res.json({ ok: true });
   } catch (e) {
@@ -1209,7 +1236,6 @@ app.get("/api/budget_snapshot", async (req, res) => {
         }
       }
     } catch {
-      // If recurring product isn't enabled or fails, just fall back to heuristics below
       streamSubs = [];
       streamBills = [];
     }
@@ -1279,11 +1305,14 @@ app.get("/api/budget_snapshot", async (req, res) => {
 /* ===== Recurring override API (from UI actions) ===== */
 app.post("/api/recurring/override", async (req, res) => {
   try {
-    const { userId: rawUserId, merchantName, type } = req.body || {};
+    const { userId: rawUserId, type } = req.body || {};
     const userId = String(rawUserId || "demo-user");
+    const merchantName = extractMerchantName(req.body);
 
     if (!merchantName || !type) {
-      return res.status(400).json({ error: "missing_fields" });
+      return res
+        .status(400)
+        .json({ error: "missing_fields", hint: "Need merchantName and type" });
     }
 
     const t = String(type || "").toLowerCase();
@@ -1292,77 +1321,77 @@ app.post("/api/recurring/override", async (req, res) => {
     }
 
     setRecurringOverride({ userId, merchantName, type: t });
+
+    // Bust caches so the next fetch reflects the override immediately
+    STREAMS_CACHE.delete(userId);
+    SUBS_RESULT_CACHE.delete(userId);
+    BILLS_RESULT_CACHE.delete(userId);
+    TXN_CACHE.delete(userId);
+
     return res.json({ ok: true });
   } catch (e) {
     return sendError(res, e);
   }
 });
 
-/* ===== Legacy-style override endpoints used by Budget UI (Option A wiring) ===== */
-app.post("/api/override/move_to_bills", async (req, res) => {
-  try {
-    const { userId: rawUserId, merchantName } = req.body || {};
-    const userId = String(rawUserId || "demo-user");
-    if (!merchantName) {
-      return res.status(400).json({ error: "missing_merchantName" });
-    }
-
-    setRecurringOverride({ userId, merchantName, type: "bill" });
-    return res.json({ ok: true });
-  } catch (e) {
-    return sendError(res, e);
+/* --- Backwards-compat endpoints for older client code --- */
+app.post("/api/override/move_to_bills", (req, res) => {
+  const userId = String(req.body?.userId || "demo-user");
+  const merchantName = extractMerchantName(req.body);
+  if (!merchantName) {
+    return res
+      .status(400)
+      .json({ error: "missing_merchantName", hint: "Send merchantName/name/merchant/normalizedName" });
   }
+  setRecurringOverride({ userId, merchantName, type: "bill" });
+  STREAMS_CACHE.delete(userId);
+  SUBS_RESULT_CACHE.delete(userId);
+  BILLS_RESULT_CACHE.delete(userId);
+  TXN_CACHE.delete(userId);
+  return res.json({ ok: true });
 });
 
-app.post("/api/override/move_to_subscriptions", async (req, res) => {
-  try {
-    const { userId: rawUserId, merchantName } = req.body || {};
-    const userId = String(rawUserId || "demo-user");
-    if (!merchantName) {
-      return res.status(400).json({ error: "missing_merchantName" });
-    }
-
-    setRecurringOverride({ userId, merchantName, type: "subscription" });
-    return res.json({ ok: true });
-  } catch (e) {
-    return sendError(res, e);
+app.post("/api/override/move_to_subscriptions", (req, res) => {
+  const userId = String(req.body?.userId || "demo-user");
+  const merchantName = extractMerchantName(req.body);
+  if (!merchantName) {
+    return res
+      .status(400)
+      .json({ error: "missing_merchantName", hint: "Send merchantName/name/merchant/normalizedName" });
   }
+  setRecurringOverride({ userId, merchantName, type: "subscription" });
+  STREAMS_CACHE.delete(userId);
+  SUBS_RESULT_CACHE.delete(userId);
+  BILLS_RESULT_CACHE.delete(userId);
+  TXN_CACHE.delete(userId);
+  return res.json({ ok: true });
 });
 
-app.post("/api/override/remove_from_bills", async (req, res) => {
-  try {
-    const { userId: rawUserId, merchantName } = req.body || {};
-    const userId = String(rawUserId || "demo-user");
-    if (!merchantName) {
-      return res.status(400).json({ error: "missing_merchantName" });
-    }
-
-    setRecurringOverride({ userId, merchantName, type: "never" });
-    return res.json({ ok: true });
-  } catch (e) {
-    return sendError(res, e);
+app.post("/api/override/remove_from_subscriptions", (req, res) => {
+  const userId = String(req.body?.userId || "demo-user");
+  const merchantName = extractMerchantName(req.body);
+  if (!merchantName) {
+    return res
+      .status(400)
+      .json({ error: "missing_merchantName", hint: "Send merchantName/name/merchant/normalizedName" });
   }
+  setRecurringOverride({ userId, merchantName, type: "never" });
+  STREAMS_CACHE.delete(userId);
+  SUBS_RESULT_CACHE.delete(userId);
+  BILLS_RESULT_CACHE.delete(userId);
+  TXN_CACHE.delete(userId);
+  return res.json({ ok: true });
 });
 
-app.post("/api/override/remove_from_subscriptions", async (req, res) => {
-  try {
-    const { userId: rawUserId, merchantName } = req.body || {};
-    const userId = String(rawUserId || "demo-user");
-    if (!merchantName) {
-      return res.status(400).json({ error: "missing_merchantName" });
-    }
-
-    setRecurringOverride({ userId, merchantName, type: "never" });
-    return res.json({ ok: true });
-  } catch (e) {
-    return sendError(res, e);
-  }
-});
-
-/* ===== Subscriptions & Bills via Plaid Recurring Streams (with fallback) ===== */
+/* ===== Subscriptions & Bills via Plaid Recurring Streams (with fallback + caching) ===== */
 app.get("/api/subscriptions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
+
+    // Quick in-memory cache so tab switching feels instant
+    const cached = getCachedRecurringResult(SUBS_RESULT_CACHE, userId);
+    if (cached) return res.json({ subscriptions: cached });
+
     const user = await getUserById(userId);
     if (!user?.access_token)
       return res.status(400).json({ error: "no_linked_item" });
@@ -1413,6 +1442,7 @@ app.get("/api/subscriptions", async (req, res) => {
         });
       }
 
+      setCachedRecurringResult(SUBS_RESULT_CACHE, userId, subs);
       return res.json({ subscriptions: subs });
     }
 
@@ -1422,6 +1452,7 @@ app.get("/api/subscriptions", async (req, res) => {
       access_token: user.access_token,
     });
     const subs = deriveSubscriptionsFromTxns(txns, userId);
+    setCachedRecurringResult(SUBS_RESULT_CACHE, userId, subs);
     return res.json({ subscriptions: subs });
   } catch (e) {
     return sendPlaidError(res, e);
@@ -1431,6 +1462,10 @@ app.get("/api/subscriptions", async (req, res) => {
 app.get("/api/bills", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
+
+    const cached = getCachedRecurringResult(BILLS_RESULT_CACHE, userId);
+    if (cached) return res.json({ bills: cached });
+
     const user = await getUserById(userId);
     if (!user?.access_token)
       return res.status(400).json({ error: "no_linked_item" });
@@ -1481,6 +1516,7 @@ app.get("/api/bills", async (req, res) => {
         });
       }
 
+      setCachedRecurringResult(BILLS_RESULT_CACHE, userId, bills);
       return res.json({ bills });
     }
 
@@ -1504,6 +1540,8 @@ app.get("/api/bills", async (req, res) => {
       website: b.website || null,
       counterparties: b.counterparties || undefined,
     }));
+
+    setCachedRecurringResult(BILLS_RESULT_CACHE, userId, bills);
     return res.json({ bills });
   } catch (e) {
     return sendPlaidError(res, e);
