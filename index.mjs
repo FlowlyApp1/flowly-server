@@ -1371,7 +1371,7 @@ app.get("/api/budget_snapshot", async (req, res) => {
     // 3) Heuristic fallback from 12 months of txns
     const heuristicSubsRaw = deriveSubscriptionsFromTxns(txns, userId);
 
-    const subscriptionMerchantNames = new Set<string>();
+    const subscriptionMerchantNames = new Set();
     for (const s of streamSubs) subscriptionMerchantNames.add(lower(s.name));
     for (const s of heuristicSubsRaw) subscriptionMerchantNames.add(lower(s.name));
 
