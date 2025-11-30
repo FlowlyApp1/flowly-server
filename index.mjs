@@ -431,6 +431,7 @@ const SUB_BRANDS = [
   "hbo",
   "paramount+",
   "paramount plus",
+  "cheaterbuster",
 ];
 
 // Whitelists (known good bills)
@@ -465,6 +466,7 @@ const BILL_BRANDS = [
   "loan",
   "navient",
   "nelnet",
+  "affirm",
 ];
 
 // Obvious one-off retail/food/gas/grocery/transport/P2P to exclude unless whitelisted
@@ -643,11 +645,22 @@ function buildItem({
 function cleanDisplayName(raw = "") {
   let name = String(raw);
 
+  // Strip generic prefixes
   name = name.replace(/^pos debit\s*-\s*/i, "");
   name = name.replace(/^ach transaction\s*/i, "");
   name = name.replace(/^transfer to\s*/i, "");
   name = name.replace(/^payment to\s*/i, "");
   name = name.replace(/^online payment\s*/i, "");
+
+  // Credit-card / loan payment cleanups
+  // e.g. "Ach Transaction Wells Fargo Card Ccpymt 0009100001 Ach Debit"
+  name = name.replace(
+    /^ach transaction\s+([a-z0-9 ]+?)\s+card ccpymt.*$/i,
+    "$1 Card Payment"
+  );
+
+  // e.g. "Credit Card Trf To Other"
+  name = name.replace(/credit card trf to other.*$/i, "Credit Card Payment");
 
   // collapse whitespace
   return name.replace(/\s+/g, " ").trim();
@@ -818,14 +831,14 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
 
   const byMerchant = groupByMerchantNormalized(expenses);
   const out = [];
-  const now = new Date();
 
   for (const [, group] of byMerchant.entries()) {
     const { key, name, rows } = group;
+    const displayName = cleanDisplayName(name);
+
     const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
     const dates = rows.map((r) => r.date);
-    const gapsMonthly = monthlyGaps(dates);
     const span = dateSpanDays(dates);
     const nameLower = name.toLowerCase();
 
@@ -836,7 +849,7 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
     }
     const overrideIsSub = override === "subscription";
 
-    // Last charge recency filter (drop old stuff)
+    // Last charge recency filter (frequency-aware)
     const lastDate =
       dates.length > 0
         ? dates.reduce(
@@ -846,7 +859,7 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
           )
         : null;
 
-    
+    const gapsMonthly = monthlyGaps(dates);
     const freqHint =
       gapsMonthly >= 1 && span >= 60 ? "monthly" : "generic";
 
@@ -864,8 +877,9 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
       !overrideIsSub &&
       (excludedByName || excludedByPFC || mostlyExcluded) &&
       !isKnownSub
-    )
+    ) {
       continue;
+    }
 
     const occ = rows.length;
     const cv = coefVar(amounts);
@@ -886,7 +900,7 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
       out.push(
         buildItem({
           id: `sub:${key}:${Math.round(median * 100)}`,
-          name: cleanDisplayName(name),
+          name: displayName,
           amount: median,
           date: latest.date,
           cycle: "monthly",
@@ -903,17 +917,21 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
   return Array.from(uniq.values()).slice(0, 50);
 }
 
-function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId = null) {
+function deriveBillsFromTxns(
+  txns,
+  subscriptionMerchantNames = new Set(),
+  userId = null
+) {
   const expenses = txns
     .filter((t) => t.type === "expense")
     .map((t) => ({ ...t, amount: Math.abs(t.amount) }));
 
   const byMerchant = groupByMerchantNormalized(expenses);
   const out = [];
-  const now = new Date();
 
   for (const [, group] of byMerchant.entries()) {
     const { name, key, rows } = group;
+    const displayName = cleanDisplayName(name);
     const nameLower = name.toLowerCase();
 
     // Some brands should basically never be bills unless explicitly overridden
@@ -935,7 +953,7 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
     const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
 
-    // Last charge recency filter (drop old bills)
+    // Last charge recency filter (frequency-aware)
     const lastDate =
       dates.length > 0
         ? dates.reduce(
@@ -944,10 +962,10 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
             dates[0]
           )
         : null;
-  
+
     const freqHint =
       gapsMonthly >= 1 && span >= 60 ? "monthly" : "generic";
-  
+
     if (lastDate && !recentEnough(lastDate, freqHint)) continue;
 
     const topPFC = topCategoryPrimary(rows) || "";
@@ -973,8 +991,9 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
       !overrideIsBill &&
       (excludedByName || excludedByPFC || mostlyExcluded) &&
       !isKnownBill
-    )
+    ) {
       continue;
+    }
 
     const occ = rows.length;
     const cv = coefVar(amounts);
@@ -1005,7 +1024,7 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
       out.push(
         buildItem({
           id: `bill:${key}:${Math.round(median * 100)}`,
-          name: cleanDisplayName(name),
+          name: displayName,
           amount: median,
           date: latest.date,
           cycle: "monthly",
