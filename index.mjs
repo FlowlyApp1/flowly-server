@@ -306,6 +306,10 @@ function normalizeTxn(t) {
     type: expense ? "expense" : "income",
     website: t.website,
     counterparties: t.counterparties,
+    logo_url:
+      t.logo_url ||
+      (Array.isArray(t.counterparties) && t.counterparties[0]?.logo_url) ||
+      null,
   };
 }
 
@@ -367,6 +371,26 @@ async function getAllTransactionsOnce({ userId, access_token }) {
 /* ============================================================================
  * Recurring detection (heuristics fallback)
  * ==========================================================================*/
+// Normalize PFC (personal finance category) strings like "FOOD_AND_DRINK"
+function normalizePFCString(s) {
+  return String(s || "").toLowerCase().replace(/_/g, " ");
+}
+
+// Frequency-aware recency (so old subs/bills drop sooner)
+const RECENT_DAYS_GENERIC_CUTOFF = 90;   // fallback
+const RECENT_DAYS_MONTHLY_CUTOFF = 60;   // e.g. monthly / weekly / bi-weekly
+const RECENT_DAYS_ANNUAL_CUTOFF = 400;   // annual charges
+
+function recentEnough(lastISO, freqHint = "generic") {
+  if (!lastISO) return true;
+  const cutoff =
+    freqHint === "monthly"
+      ? RECENT_DAYS_MONTHLY_CUTOFF
+      : freqHint === "annual"
+      ? RECENT_DAYS_ANNUAL_CUTOFF
+      : RECENT_DAYS_GENERIC_CUTOFF;
+  return daysBetween(lastISO, new Date()) <= cutoff;
+}
 
 // Whitelists (known good subscriptions)
 const SUB_BRANDS = [
@@ -480,6 +504,9 @@ const EXCLUDE_HINTS = [
   "cafe",
   "coffee",
   "kitchen",
+  "pizza",
+  "hungry howie",
+  "howie",
 
   // Gas / convenience
   "wawa",
@@ -530,6 +557,19 @@ const EXCLUDE_HINTS = [
   "zelle",
 ];
 
+// Brands that should basically never be treated as "bills" by heuristics
+// (we still allow them if Plaid recurring explicitly classifies them as bills
+// or the user overrides them).
+const NEVER_BILL_BRANDS = [
+  "uber",
+  "lyft",
+  "steam",
+  "playstation",
+  "xbox",
+  "crypto.com",
+  "crypto com",
+];
+
 // PFC categories to exclude unless on whitelist
 const EXCLUDE_PFC = [
   "restaurant",
@@ -574,7 +614,16 @@ function pickWebsiteFromNormalized(t) {
   return cp?.website || null;
 }
 
-function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
+function buildItem({
+  id,
+  name,
+  amount,
+  date,
+  cycle,
+  website,
+  counterparties,
+  logo_url,
+}) {
   const norm = normalizeMerchant(name);
   return {
     id,
@@ -586,8 +635,22 @@ function buildItem({ id, name, amount, date, cycle, website, counterparties }) {
       cycle === "monthly" ? nextMonthlyFrom(date) : addDays(date, 365),
     website: website || null,
     counterparties: counterparties || undefined,
+    logo_url: logo_url || undefined,
     alerts: false,
   };
+}
+
+function cleanDisplayName(raw = "") {
+  let name = String(raw);
+
+  name = name.replace(/^pos debit\s*-\s*/i, "");
+  name = name.replace(/^ach transaction\s*/i, "");
+  name = name.replace(/^transfer to\s*/i, "");
+  name = name.replace(/^payment to\s*/i, "");
+  name = name.replace(/^online payment\s*/i, "");
+
+  // collapse whitespace
+  return name.replace(/\s+/g, " ").trim();
 }
 
 function normalizeMerchant(name = "") {
@@ -626,7 +689,7 @@ function merchantMatches(key, list) {
 function topCategoryPrimary(rows) {
   const counts = new Map();
   for (const r of rows) {
-    const c = (r.pfcPrimary || r.categoryId || "").toLowerCase();
+    const c = normalizePFCString(r.pfcPrimary || r.categoryId || "");
     if (!c) continue;
     counts.set(c, (counts.get(c) || 0) + 1);
   }
@@ -646,7 +709,7 @@ function isMostlyExcludedCategory(rows) {
   let total = 0;
   let excluded = 0;
   for (const r of rows) {
-    const c = (r.pfcPrimary || r.categoryId || "").toLowerCase();
+    const c = normalizePFCString(r.pfcPrimary || r.categoryId || "");
     if (!c) continue;
     total += 1;
     if (EXCLUDE_PFC.some((p) => c.includes(p))) {
@@ -668,7 +731,7 @@ function coefVar(nums) {
 
 // Bill-ish category check for normalized PFC
 function isBillishPFC(pfc) {
-  const p = (pfc || "").toLowerCase();
+  const p = normalizePFCString(pfc);
   if (!p) return false;
   return (
     p.includes("utility") ||
@@ -762,6 +825,7 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
     const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
     const dates = rows.map((r) => r.date);
+    const gapsMonthly = monthlyGaps(dates);
     const span = dateSpanDays(dates);
     const nameLower = name.toLowerCase();
 
@@ -781,7 +845,12 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
             dates[0]
           )
         : null;
-    if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
+
+    
+    const freqHint =
+      gapsMonthly >= 1 && span >= 60 ? "monthly" : "generic";
+
+    if (lastDate && !recentEnough(lastDate, freqHint)) continue;
 
     const topPFC = topCategoryPrimary(rows) || "";
     const isKnownSub = overrideIsSub || merchantMatches(nameLower, SUB_BRANDS);
@@ -804,7 +873,6 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
     // Known subs: still a bit lenient but favor fixed-ish prices
     const passesKnown = isKnownSub && occ >= 1;
 
-    const gapsMonthly = monthlyGaps(dates);
     const passesUnknown =
       !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
 
@@ -818,12 +886,13 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
       out.push(
         buildItem({
           id: `sub:${key}:${Math.round(median * 100)}`,
-          name,
+          name: cleanDisplayName(name),
           amount: median,
           date: latest.date,
           cycle: "monthly",
           website: pickWebsiteFromNormalized(latest),
           counterparties: latest.counterparties,
+          logo_url: latest.logo_url,
         })
       );
     }
@@ -846,6 +915,9 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
   for (const [, group] of byMerchant.entries()) {
     const { name, key, rows } = group;
     const nameLower = name.toLowerCase();
+
+    // Some brands should basically never be bills unless explicitly overridden
+    const neverBillBrand = merchantMatches(nameLower, NEVER_BILL_BRANDS);
 
     // Don't show something as a bill if we've already decided it's a subscription
     if (subscriptionMerchantNames.has(nameLower)) continue;
@@ -872,12 +944,25 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
             dates[0]
           )
         : null;
-    if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) continue;
+  
+    const freqHint =
+      gapsMonthly >= 1 && span >= 60 ? "monthly" : "generic";
+  
+    if (lastDate && !recentEnough(lastDate, freqHint)) continue;
 
     const topPFC = topCategoryPrimary(rows) || "";
     const isKnownBill = overrideIsBill || merchantMatches(nameLower, BILL_BRANDS);
     const isKnownSub = merchantMatches(nameLower, SUB_BRANDS);
     const billishByCategory = isBillishPFC(topPFC);
+
+    if (
+      neverBillBrand &&
+      !overrideIsBill &&
+      !isKnownBill &&
+      !billishByCategory
+    ) {
+      continue;
+    }
 
     const excludedByName = merchantMatches(nameLower, EXCLUDE_HINTS);
     const excludedByPFC = EXCLUDE_PFC.some((c) => topPFC.includes(c));
@@ -895,17 +980,23 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
     const cv = coefVar(amounts);
 
     let passes = false;
+    let cvLimit = 1.0;
 
     if (isKnownBill) {
+      // Trusted brands: just need at least one recent occurrence
       passes = occ >= 1 && span >= 0;
     } else if (billishByCategory && !isKnownSub) {
+      // Utilities / loans / insurance: a bit lenient
       passes = occ >= 2 && span >= 25;
+      cvLimit = 0.8;
     } else if (!isKnownSub) {
-      passes = occ >= 3 && span >= 60 && gapsMonthly >= 1;
+      // Completely unknown "bills" must be VERY consistent
+      passes = occ >= 4 && span >= 90 && gapsMonthly >= 2;
+      cvLimit = 0.5;
     }
 
-    // Bills can fluctuate more than subs, but not be completely random
-    const stable = cv <= 1.0;
+    // Bills can fluctuate more than subs, but shouldn't be random
+    const stable = cv <= cvLimit;
 
     if (passes && stable) {
       const latest = rows.sort(
@@ -914,12 +1005,13 @@ function deriveBillsFromTxns(txns, subscriptionMerchantNames = new Set(), userId
       out.push(
         buildItem({
           id: `bill:${key}:${Math.round(median * 100)}`,
-          name,
+          name: cleanDisplayName(name),
           amount: median,
           date: latest.date,
           cycle: "monthly",
           website: pickWebsiteFromNormalized(latest),
           counterparties: latest.counterparties,
+          logo_url: latest.logo_url,
         })
       );
     }
@@ -1315,11 +1407,12 @@ app.get("/api/budget_snapshot", async (req, res) => {
           if (!kind) continue;
 
           const lastDate = s.last_date || s.first_date || null;
-          if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) {
+          const { days, cycle } = freqToInfo(s.frequency);
+          const freqHint = cycle === "annual" ? "annual" : "monthly";
+  
+          if (lastDate && !recentEnough(lastDate, freqHint)) {
             continue;
           }
-
-          const { days, cycle } = freqToInfo(s.frequency);
           const next =
             s.next_date ||
             (s.last_date
@@ -1331,7 +1424,9 @@ app.get("/api/budget_snapshot", async (req, res) => {
           if (kind === "subscription") {
             streamSubs.push({
               id: s.stream_id,
-              name: s.merchant_name || s.description || "Subscription",
+              name: cleanDisplayName(
+                s.merchant_name || s.description || "Subscription"
+              ),
               normalizedName: normalizeMerchant(
                 s.merchant_name || s.description || "Subscription"
               ),
@@ -1347,7 +1442,9 @@ app.get("/api/budget_snapshot", async (req, res) => {
           } else if (kind === "bill") {
             streamBills.push({
               id: s.stream_id,
-              name: s.merchant_name || s.description || "Bill",
+              name: cleanDisplayName(
+                s.merchant_name || s.description || "Bill"
+              ),
               normalizedName: normalizeMerchant(
                 s.merchant_name || s.description || "Bill"
               ),
@@ -1554,11 +1651,12 @@ app.get("/api/subscriptions", async (req, res) => {
         if (kind !== "subscription") continue;
 
         const lastDate = s.last_date || s.first_date || null;
-        if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) {
+        const { days, cycle } = freqToInfo(s.frequency);
+        const freqHint = cycle === "annual" ? "annual" : "monthly";
+
+        if (lastDate && !recentEnough(lastDate, freqHint)) {
           continue;
         }
-
-        const { days, cycle } = freqToInfo(s.frequency);
         const next =
           s.next_date ||
           (s.last_date
@@ -1569,7 +1667,9 @@ app.get("/api/subscriptions", async (req, res) => {
 
         subs.push({
           id: s.stream_id,
-          name: s.merchant_name || s.description || "Subscription",
+          name: cleanDisplayName(
+            s.merchant_name || s.description || "Subscription"
+          ),
           normalizedName: normalizeMerchant(
             s.merchant_name || s.description || "Subscription"
           ),
@@ -1646,11 +1746,12 @@ app.get("/api/bills", async (req, res) => {
         if (kind !== "bill") continue;
 
         const lastDate = s.last_date || s.first_date || null;
-        if (lastDate && daysBetween(lastDate, now) > RECENT_DAYS_CUTOFF) {
+        const { days, cycle } = freqToInfo(s.frequency);
+        const freqHint = cycle === "annual" ? "annual" : "monthly";
+
+        if (lastDate && !recentEnough(lastDate, freqHint)) {
           continue;
         }
-
-        const { days } = freqToInfo(s.frequency);
         const next =
           s.next_date ||
           (s.last_date
@@ -1661,7 +1762,9 @@ app.get("/api/bills", async (req, res) => {
 
         bills.push({
           id: s.stream_id,
-          name: s.merchant_name || s.description || "Bill",
+          name: cleanDisplayName(
+            s.merchant_name || s.description || "Bill"
+          ),
           normalizedName: normalizeMerchant(
             s.merchant_name || s.description || "Bill"
           ),
