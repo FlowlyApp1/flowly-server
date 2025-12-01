@@ -4,11 +4,11 @@ import "dotenv/config";
 import express from "express";
 import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
 import {
-  getCursor,
-  getUserById,
-  getUserIdByItemId,
-  setUserCursor,
-  upsertUserItem,
+    getCursor,
+    getUserById,
+    getUserIdByItemId,
+    setUserCursor,
+    upsertUserItem,
 } from "./firebase.mjs";
 
 const app = express();
@@ -318,24 +318,58 @@ async function getAllTransactionsOnce({ userId, access_token }) {
   const hit = TXN_CACHE.get(userId);
   if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.txns;
 
-  // 1) Run /transactions/sync to keep cursor + webhooks working
-  let cursor = await getCursor(userId);
-  let hasMoreSync = true;
+  // --- 1) Run /transactions/sync with a retry for
+  //     TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION ---
+  let cursor;
+  let synced = false;
 
-  while (hasMoreSync) {
-    const sync = await plaid.transactionsSync({
-      access_token,
-      cursor: cursor || undefined,
-      count: 500,
-    });
-    const nextCursor = sync.data.next_cursor;
-    cursor = nextCursor;
-    hasMoreSync = !!sync.data.has_more;
+  for (let attempt = 0; attempt < 2 && !synced; attempt++) {
+    cursor = await getCursor(userId);
+    let hasMoreSync = true;
+
+    try {
+      while (hasMoreSync) {
+        const sync = await plaid.transactionsSync({
+          access_token,
+          cursor: cursor || undefined,
+          count: 500,
+        });
+
+        const nextCursor = sync.data.next_cursor;
+        cursor = nextCursor;
+        hasMoreSync = !!sync.data.has_more;
+      }
+
+      await setUserCursor(userId, cursor);
+      synced = true;
+    } catch (e) {
+      const code =
+        e?.response?.data?.error_code ||
+        e?.error_code ||
+        e?.code ||
+        "";
+
+      if (
+        code === "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION" &&
+        attempt === 0
+      ) {
+        // Plaid says underlying data changed mid-pagination.
+        // Reset cursor and retry the sync once from scratch.
+        console.warn(
+          "transactionsSync mutation during pagination; resetting cursor and retrying once for user",
+          userId
+        );
+        await setUserCursor(userId, null);
+        TXN_CACHE.delete(userId);
+        continue; // go to next attempt
+      }
+
+      // Anything else (or second failure) → bubble up so the client sees the real error
+      throw e;
+    }
   }
 
-  await setUserCursor(userId, cursor);
-
-  // 2) Always fetch up to last 12 months of history via /transactions/get (with pagination)
+  // --- 2) Always fetch up to last 12 months of history via /transactions/get (with pagination) ---
   const end = new Date();
   const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000); // ~12 months
 
@@ -647,20 +681,43 @@ function cleanDisplayName(raw = "") {
 
   // Strip generic prefixes
   name = name.replace(/^pos debit\s*-\s*/i, "");
+  name = name.replace(/^pos purchase\s*-\s*/i, "");
   name = name.replace(/^ach transaction\s*/i, "");
-  name = name.replace(/^transfer to\s*/i, "");
+  name = name.replace(/^debit card purchase\s*/i, "");
   name = name.replace(/^payment to\s*/i, "");
   name = name.replace(/^online payment\s*/i, "");
+  name = name.replace(/^transfer to\s*/i, "");
+  name = name.replace(/^transfer from\s*/i, "");
 
-  // Credit-card / loan payment cleanups
+  // Common "CARD CCPYMT" / "CARD PAYMENT" style descriptors
   // e.g. "Ach Transaction Wells Fargo Card Ccpymt 0009100001 Ach Debit"
   name = name.replace(
     /^ach transaction\s+([a-z0-9 ]+?)\s+card ccpymt.*$/i,
     "$1 Card Payment"
   );
+  name = name.replace(
+    /^([a-z0-9 ]+?)\s+card ccpymt.*$/i,
+    "$1 Card Payment"
+  );
 
+  // e.g. "Credit First Na Cfna Pymt 0004120298 Ach Debit"
+  name = name.replace(
+    /^([a-z0-9 ]+?)\s+pymt\s+[0-9]+.*$/i,
+    "$1 Payment"
+  );
+
+  // Generic credit card transfer descriptions
   // e.g. "Credit Card Trf To Other"
   name = name.replace(/credit card trf to other.*$/i, "Credit Card Payment");
+  name = name.replace(/credit card payment to.*$/i, "Credit Card Payment");
+
+  // Remove trailing ACH / DEBIT noise
+  name = name.replace(/\s+ach debit$/i, "");
+  name = name.replace(/\s+ach credit$/i, "");
+  name = name.replace(/\s+ach$/i, "");
+
+  // Collapse any long numeric tails (e.g. "... 0009100001 001")
+  name = name.replace(/\s+[0-9]{4,}(\s+[0-9]{2,})*$/i, "");
 
   // collapse whitespace
   return name.replace(/\s+/g, " ").trim();
@@ -884,14 +941,37 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
     const occ = rows.length;
     const cv = coefVar(amounts);
 
+    // Amount-based hints
+    const isLarge = median >= 100;
+    const cents = Math.round(median * 100);
+    const endsIn99 = cents % 100 === 99;
+    const subAmountish = median >= 3 && median <= 80;
+    const looksSubByAmount = subAmountish && endsIn99;
+
     // Known subs: still a bit lenient but favor fixed-ish prices
     const passesKnown = isKnownSub && occ >= 1;
 
-    const passesUnknown =
-      !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
+    let passesUnknown = false;
+    let cvLimit = 0.2;
+
+    if (!isKnownSub && !isKnownBill) {
+      if (looksSubByAmount) {
+        // Sub-like price (e.g. 9.99, 24.99) – allow slightly easier pattern
+        passesUnknown = occ >= 3 && span >= 60 && gapsMonthly >= 1;
+        cvLimit = 0.25;
+      } else if (isLarge) {
+        // Large recurring charges should very clearly look like a subscription to qualify
+        passesUnknown = occ >= 4 && span >= 90 && gapsMonthly >= 2;
+        cvLimit = 0.15;
+      } else {
+        // Neutral amounts: require stronger pattern to be safe
+        passesUnknown = occ >= 4 && span >= 90 && gapsMonthly >= 2;
+        cvLimit = 0.2;
+      }
+    }
 
     // Subscriptions should be “mostly fixed”
-    const stable = isKnownSub ? cv <= 0.4 : cv <= 0.2;
+    const stable = isKnownSub ? cv <= 0.4 : cv <= cvLimit;
 
     if ((passesKnown || passesUnknown) && stable) {
       const latest = rows.sort(
@@ -953,6 +1033,9 @@ function deriveBillsFromTxns(
     const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
 
+    // Amount-based hint: larger recurring charges often behave like bills
+    const isLarge = median >= 100;
+
     // Last charge recency filter (frequency-aware)
     const lastDate =
       dates.length > 0
@@ -1009,9 +1092,16 @@ function deriveBillsFromTxns(
       passes = occ >= 2 && span >= 25;
       cvLimit = 0.8;
     } else if (!isKnownSub) {
-      // Completely unknown "bills" must be VERY consistent
-      passes = occ >= 4 && span >= 90 && gapsMonthly >= 2;
-      cvLimit = 0.5;
+      // Completely unknown "bills"
+      if (isLarge) {
+        // Large recurring charges: slightly easier thresholds, still require clear recurrence
+        passes = occ >= 3 && span >= 60 && gapsMonthly >= 1;
+        cvLimit = 0.6;
+      } else {
+        // Smaller unknowns must be very consistent to be considered bills
+        passes = occ >= 4 && span >= 90 && gapsMonthly >= 2;
+        cvLimit = 0.5;
+      }
     }
 
     // Bills can fluctuate more than subs, but shouldn't be random
@@ -1909,4 +1999,3 @@ app.get("/api/debug/recurring", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Flowly server running on http://localhost:${PORT}`);
 });
-   
