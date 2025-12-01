@@ -374,38 +374,7 @@ async function getAllTransactionsOnce({ userId, access_token }) {
     );
   }
 
-  // --- 2) Always fetch up to last 12 months of history via /transactions/get (with pagination) ---
-  const end = new Date();
-  const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000); // ~12 months
-
-  let all = [];
-  let offset = 0;
-  let hasMorePages = true;
-
-  while (hasMorePages) {
-    const resp = await plaid.transactionsGet({
-      access_token,
-      start_date: toISO(start),
-      end_date: toISO(end),
-      options: {
-        count: 500,
-        offset,
-        include_personal_finance_category: true,
-      },
-    });
-
-    const txns = resp.data.transactions || [];
-    const total = resp.data.total_transactions || 0;
-
-    all = all.concat(txns);
-    offset = all.length;
-    hasMorePages = all.length < total;
-  }
-
-  const normalized = all.map(normalizeTxn);
-  TXN_CACHE.set(userId, { ts: Date.now(), txns: normalized });
-  return normalized;
-}
+ 
 
   // --- 2) Always fetch up to last 12 months of history via /transactions/get (with pagination) ---
   const end = new Date();
