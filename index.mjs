@@ -318,24 +318,58 @@ async function getAllTransactionsOnce({ userId, access_token }) {
   const hit = TXN_CACHE.get(userId);
   if (hit && Date.now() - hit.ts < CACHE_TTL_MS) return hit.txns;
 
-  // 1) Run /transactions/sync to keep cursor + webhooks working
-  let cursor = await getCursor(userId);
-  let hasMoreSync = true;
+  // --- 1) Run /transactions/sync with a retry for
+  //     TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION ---
+  let cursor;
+  let synced = false;
 
-  while (hasMoreSync) {
-    const sync = await plaid.transactionsSync({
-      access_token,
-      cursor: cursor || undefined,
-      count: 500,
-    });
-    const nextCursor = sync.data.next_cursor;
-    cursor = nextCursor;
-    hasMoreSync = !!sync.data.has_more;
+  for (let attempt = 0; attempt < 2 && !synced; attempt++) {
+    cursor = await getCursor(userId);
+    let hasMoreSync = true;
+
+    try {
+      while (hasMoreSync) {
+        const sync = await plaid.transactionsSync({
+          access_token,
+          cursor: cursor || undefined,
+          count: 500,
+        });
+
+        const nextCursor = sync.data.next_cursor;
+        cursor = nextCursor;
+        hasMoreSync = !!sync.data.has_more;
+      }
+
+      await setUserCursor(userId, cursor);
+      synced = true;
+    } catch (e) {
+      const code =
+        e?.response?.data?.error_code ||
+        e?.error_code ||
+        e?.code ||
+        "";
+
+      if (
+        code === "TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION" &&
+        attempt === 0
+      ) {
+        // Plaid says underlying data changed mid-pagination.
+        // Reset cursor and retry the sync once from scratch.
+        console.warn(
+          "transactionsSync mutation during pagination; resetting cursor and retrying once for user",
+          userId
+        );
+        await setUserCursor(userId, null);
+        TXN_CACHE.delete(userId);
+        continue; // go to next attempt
+      }
+
+      // Anything else (or second failure) → bubble up so the client sees the real error
+      throw e;
+    }
   }
 
-  await setUserCursor(userId, cursor);
-
-  // 2) Always fetch up to last 12 months of history via /transactions/get (with pagination)
+  // --- 2) Always fetch up to last 12 months of history via /transactions/get (with pagination) ---
   const end = new Date();
   const start = new Date(end.getTime() - 365 * 24 * 60 * 60 * 1000); // ~12 months
 
