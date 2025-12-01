@@ -647,20 +647,43 @@ function cleanDisplayName(raw = "") {
 
   // Strip generic prefixes
   name = name.replace(/^pos debit\s*-\s*/i, "");
+  name = name.replace(/^pos purchase\s*-\s*/i, "");
   name = name.replace(/^ach transaction\s*/i, "");
-  name = name.replace(/^transfer to\s*/i, "");
+  name = name.replace(/^debit card purchase\s*/i, "");
   name = name.replace(/^payment to\s*/i, "");
   name = name.replace(/^online payment\s*/i, "");
+  name = name.replace(/^transfer to\s*/i, "");
+  name = name.replace(/^transfer from\s*/i, "");
 
-  // Credit-card / loan payment cleanups
+  // Common "CARD CCPYMT" / "CARD PAYMENT" style descriptors
   // e.g. "Ach Transaction Wells Fargo Card Ccpymt 0009100001 Ach Debit"
   name = name.replace(
     /^ach transaction\s+([a-z0-9 ]+?)\s+card ccpymt.*$/i,
     "$1 Card Payment"
   );
+  name = name.replace(
+    /^([a-z0-9 ]+?)\s+card ccpymt.*$/i,
+    "$1 Card Payment"
+  );
 
+  // e.g. "Credit First Na Cfna Pymt 0004120298 Ach Debit"
+  name = name.replace(
+    /^([a-z0-9 ]+?)\s+pymt\s+[0-9]+.*$/i,
+    "$1 Payment"
+  );
+
+  // Generic credit card transfer descriptions
   // e.g. "Credit Card Trf To Other"
   name = name.replace(/credit card trf to other.*$/i, "Credit Card Payment");
+  name = name.replace(/credit card payment to.*$/i, "Credit Card Payment");
+
+  // Remove trailing ACH / DEBIT noise
+  name = name.replace(/\s+ach debit$/i, "");
+  name = name.replace(/\s+ach credit$/i, "");
+  name = name.replace(/\s+ach$/i, "");
+
+  // Collapse any long numeric tails (e.g. "... 0009100001 001")
+  name = name.replace(/\s+[0-9]{4,}(\s+[0-9]{2,})*$/i, "");
 
   // collapse whitespace
   return name.replace(/\s+/g, " ").trim();
