@@ -884,14 +884,37 @@ function deriveSubscriptionsFromTxns(txns, userId = null) {
     const occ = rows.length;
     const cv = coefVar(amounts);
 
+    // Amount-based hints
+    const isLarge = median >= 100;
+    const cents = Math.round(median * 100);
+    const endsIn99 = cents % 100 === 99;
+    const subAmountish = median >= 3 && median <= 80;
+    const looksSubByAmount = subAmountish && endsIn99;
+
     // Known subs: still a bit lenient but favor fixed-ish prices
     const passesKnown = isKnownSub && occ >= 1;
 
-    const passesUnknown =
-      !isKnownSub && !isKnownBill && occ >= 3 && span >= 60 && gapsMonthly >= 1;
+    let passesUnknown = false;
+    let cvLimit = 0.2;
+
+    if (!isKnownSub && !isKnownBill) {
+      if (looksSubByAmount) {
+        // Sub-like price (e.g. 9.99, 24.99) – allow slightly easier pattern
+        passesUnknown = occ >= 3 && span >= 60 && gapsMonthly >= 1;
+        cvLimit = 0.25;
+      } else if (isLarge) {
+        // Large recurring charges should very clearly look like a subscription to qualify
+        passesUnknown = occ >= 4 && span >= 90 && gapsMonthly >= 2;
+        cvLimit = 0.15;
+      } else {
+        // Neutral amounts: require stronger pattern to be safe
+        passesUnknown = occ >= 4 && span >= 90 && gapsMonthly >= 2;
+        cvLimit = 0.2;
+      }
+    }
 
     // Subscriptions should be “mostly fixed”
-    const stable = isKnownSub ? cv <= 0.4 : cv <= 0.2;
+    const stable = isKnownSub ? cv <= 0.4 : cv <= cvLimit;
 
     if ((passesKnown || passesUnknown) && stable) {
       const latest = rows.sort(
@@ -953,6 +976,9 @@ function deriveBillsFromTxns(
     const amounts = rows.map((r) => r.amount).sort((a, b) => a - b);
     const median = amounts[Math.floor(amounts.length / 2)] || 0;
 
+    // Amount-based hint: larger recurring charges often behave like bills
+    const isLarge = median >= 100;
+
     // Last charge recency filter (frequency-aware)
     const lastDate =
       dates.length > 0
@@ -1009,9 +1035,16 @@ function deriveBillsFromTxns(
       passes = occ >= 2 && span >= 25;
       cvLimit = 0.8;
     } else if (!isKnownSub) {
-      // Completely unknown "bills" must be VERY consistent
-      passes = occ >= 4 && span >= 90 && gapsMonthly >= 2;
-      cvLimit = 0.5;
+      // Completely unknown "bills"
+      if (isLarge) {
+        // Large recurring charges: slightly easier thresholds, still require clear recurrence
+        passes = occ >= 3 && span >= 60 && gapsMonthly >= 1;
+        cvLimit = 0.6;
+      } else {
+        // Smaller unknowns must be very consistent to be considered bills
+        passes = occ >= 4 && span >= 90 && gapsMonthly >= 2;
+        cvLimit = 0.5;
+      }
     }
 
     // Bills can fluctuate more than subs, but shouldn't be random
@@ -1909,4 +1942,3 @@ app.get("/api/debug/recurring", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Flowly server running on http://localhost:${PORT}`);
 });
-   
