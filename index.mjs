@@ -4,11 +4,11 @@ import "dotenv/config";
 import express from "express";
 import { Configuration, PlaidApi, PlaidEnvironments } from "plaid";
 import {
-    getCursor,
-    getUserById,
-    getUserIdByItemId,
-    setUserCursor,
-    upsertUserItem,
+  getCursor,
+  getUserById,
+  getUserIdByItemId,
+  setUserCursor,
+  upsertUserItem,
 } from "./firebase.mjs";
 
 const app = express();
@@ -591,6 +591,19 @@ const EXCLUDE_HINTS = [
   "cashapp",
   "paypal",
   "zelle",
+
+  // ATM / transfers / promo spend
+  "atm",
+  "atm fee",
+  "withdrawal",
+  "cash withdrawal",
+  "cash advance",
+  "transfer",
+  "trf",
+  "trf to other",
+  "tiktok",
+  "tiktok promote",
+  "promote",
 ];
 
 // Brands that should basically never be treated as "bills" by heuristics
@@ -1014,6 +1027,26 @@ function deriveBillsFromTxns(
     const displayName = cleanDisplayName(name);
     const nameLower = name.toLowerCase();
 
+    // Hard exclusions: repeating does not automatically mean "bill"
+    if (
+      nameLower.includes("atm") ||
+      nameLower.includes("atm fee") ||
+      nameLower.includes("withdrawal") ||
+      nameLower.includes("cash withdrawal") ||
+      nameLower.includes("cash advance") ||
+      nameLower.includes("transfer") ||
+      nameLower.includes("trf") ||
+      nameLower.includes("trf to other") ||
+      nameLower.includes("tiktok") ||
+      nameLower.includes("promote") ||
+      nameLower.includes("venmo") ||
+      nameLower.includes("paypal") ||
+      nameLower.includes("cash app") ||
+      nameLower.includes("zelle")
+    ) {
+      continue;
+    }
+
     // Some brands should basically never be bills unless explicitly overridden
     const neverBillBrand = merchantMatches(nameLower, NEVER_BILL_BRANDS);
 
@@ -1157,6 +1190,27 @@ function freqToInfo(freq) {
 function classifyStream(s, userId = null) {
   const rawName = s.merchant_name || s.description || "";
   const name = rawName.toLowerCase();
+
+  // Hard exclusions: repeating does not automatically mean "bill"
+  if (
+    name.includes("atm") ||
+    name.includes("atm fee") ||
+    name.includes("withdrawal") ||
+    name.includes("cash withdrawal") ||
+    name.includes("cash advance") ||
+    name.includes("transfer") ||
+    name.includes("trf") ||
+    name.includes("trf to other") ||
+    name.includes("tiktok") ||
+    name.includes("promote") ||
+    name.includes("venmo") ||
+    name.includes("paypal") ||
+    name.includes("cash app") ||
+    name.includes("zelle")
+  ) {
+    return null;
+  }
+  
   const pfcPrimary = s.personal_finance_category?.primary?.toLowerCase?.() || "";
   const categories = (Array.isArray(s.category) ? s.category : []).map((c) =>
     String(c).toLowerCase()
