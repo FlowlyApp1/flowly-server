@@ -1791,7 +1791,6 @@ app.get("/api/subscriptions", async (req, res) => {
   try {
     const userId = String(req.query.userId || "demo-user");
 
-    // Quick in-memory cache so tab switching feels instant
     const cached = getCachedRecurringResult(SUBS_RESULT_CACHE, userId);
     if (cached) return res.json({ subscriptions: cached });
 
@@ -1809,10 +1808,9 @@ app.get("/api/subscriptions", async (req, res) => {
       streams = [];
     }
 
+    // Build stream-based subscriptions first
+    let streamSubs = [];
     if (streams.length > 0) {
-      const subs = [];
-      const now = new Date();
-
       for (const s of streams) {
         const kind = classifyStream(s, userId);
         if (kind !== "subscription") continue;
@@ -1824,6 +1822,7 @@ app.get("/api/subscriptions", async (req, res) => {
         if (lastDate && !recentEnough(lastDate, freqHint)) {
           continue;
         }
+
         const next =
           s.next_date ||
           (s.last_date
@@ -1832,7 +1831,7 @@ app.get("/api/subscriptions", async (req, res) => {
             ? addDays(s.first_date, days)
             : toISO(new Date()));
 
-        subs.push({
+        streamSubs.push({
           id: s.stream_id,
           name: cleanDisplayName(
             s.merchant_name || s.description || "Subscription"
@@ -1850,32 +1849,40 @@ app.get("/api/subscriptions", async (req, res) => {
           counterparties: s.counterparties || undefined,
         });
       }
-
-      const deduped = dedupeByMerchantName(subs);
-      setCachedRecurringResult(SUBS_RESULT_CACHE, userId, deduped);
-      return res.json({ subscriptions: deduped });
     }
 
-    // Fallback
+    // Always compute fallback too, then merge
     const txns = await getAllTransactionsOnce({
       userId,
       access_token: user.access_token,
     });
-    const subsRaw = deriveSubscriptionsFromTxns(txns, userId);
-    const subs = dedupeByMerchantName(
-      subsRaw.map((s) => ({
-        id: s.id,
-        name: s.name,
-        normalizedName: s.normalizedName || normalizeMerchant(s.name),
-        amount: s.amount,
-        cycle: s.cycle,
-        nextCharge: s.nextCharge,
-        isPaused: false,
-        alerts: false,
-        website: s.website || null,
-        counterparties: s.counterparties || undefined,
-      }))
-    );
+
+    const fallbackSubsRaw = deriveSubscriptionsFromTxns(txns, userId);
+
+    const lower = (s) => (s || "").toLowerCase().trim();
+    const streamSubNames = new Set(streamSubs.map((s) => lower(s.name)));
+
+    const mergedSubsPreDedupe = [
+      ...streamSubs,
+      ...fallbackSubsRaw
+        .filter((s) => !streamSubNames.has(lower(s.name)))
+        .map((s) => ({
+          id: s.id,
+          name: s.name,
+          normalizedName: s.normalizedName || normalizeMerchant(s.name),
+          amount: s.amount,
+          cycle: s.cycle,
+          nextCharge: s.nextCharge,
+          isPaused: false,
+          alerts: false,
+          website: s.website || null,
+          counterparties: s.counterparties || undefined,
+          logo_url: s.logo_url || undefined,
+        })),
+    ];
+
+    const subs = dedupeByMerchantName(mergedSubsPreDedupe);
+
     setCachedRecurringResult(SUBS_RESULT_CACHE, userId, subs);
     return res.json({ subscriptions: subs });
   } catch (e) {
@@ -1904,10 +1911,9 @@ app.get("/api/bills", async (req, res) => {
       streams = [];
     }
 
+    // Build stream-based bills first
+    let streamBills = [];
     if (streams.length > 0) {
-      const bills = [];
-      const now = new Date();
-
       for (const s of streams) {
         const kind = classifyStream(s, userId);
         if (kind !== "bill") continue;
@@ -1919,6 +1925,7 @@ app.get("/api/bills", async (req, res) => {
         if (lastDate && !recentEnough(lastDate, freqHint)) {
           continue;
         }
+
         const next =
           s.next_date ||
           (s.last_date
@@ -1927,7 +1934,7 @@ app.get("/api/bills", async (req, res) => {
             ? addDays(s.first_date, days)
             : toISO(new Date()));
 
-        bills.push({
+        streamBills.push({
           id: s.stream_id,
           name: cleanDisplayName(
             s.merchant_name || s.description || "Bill"
@@ -1945,36 +1952,48 @@ app.get("/api/bills", async (req, res) => {
           counterparties: s.counterparties || undefined,
         });
       }
-
-      const deduped = dedupeByMerchantName(bills);
-      setCachedRecurringResult(BILLS_RESULT_CACHE, userId, deduped);
-      return res.json({ bills: deduped });
     }
 
-    // Fallback — use subs to avoid duplicates
+    // Always compute fallback too
     const txns = await getAllTransactionsOnce({
       userId,
       access_token: user.access_token,
     });
+
     const subsFallback = deriveSubscriptionsFromTxns(txns, userId);
     const subMerchantNames = new Set(
       subsFallback.map((s) => (s.name || "").toLowerCase().trim())
     );
-    const billsRaw = deriveBillsFromTxns(txns, subMerchantNames, userId);
-    const bills = dedupeByMerchantName(
-      billsRaw.map((b) => ({
-        id: b.id,
-        name: b.name,
-        normalizedName: b.normalizedName || normalizeMerchant(b.name),
-        amount: b.amount,
-        dueDate: b.nextCharge,
-        autopay: false,
-        variable: false,
-        alerts: false,
-        website: b.website || null,
-        counterparties: b.counterparties || undefined,
-      }))
+
+    const fallbackBillsRaw = deriveBillsFromTxns(
+      txns,
+      subMerchantNames,
+      userId
     );
+
+    const lower = (s) => (s || "").toLowerCase().trim();
+    const streamBillNames = new Set(streamBills.map((b) => lower(b.name)));
+
+    const mergedBillsPreDedupe = [
+      ...streamBills,
+      ...fallbackBillsRaw
+        .filter((b) => !streamBillNames.has(lower(b.name)))
+        .map((b) => ({
+          id: b.id,
+          name: b.name,
+          normalizedName: b.normalizedName || normalizeMerchant(b.name),
+          amount: b.amount,
+          dueDate: b.nextCharge,
+          autopay: false,
+          variable: false,
+          alerts: false,
+          website: b.website || null,
+          counterparties: b.counterparties || undefined,
+          logo_url: b.logo_url || undefined,
+        })),
+    ];
+
+    const bills = dedupeByMerchantName(mergedBillsPreDedupe);
 
     setCachedRecurringResult(BILLS_RESULT_CACHE, userId, bills);
     return res.json({ bills });
